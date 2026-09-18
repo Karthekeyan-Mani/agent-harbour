@@ -290,7 +290,8 @@ def rendered_home() -> str:
         sighting_rows = conn.execute("""
           SELECT crawler, operator, path, hit_count
           FROM sightings 
-          WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact', 'Honeypot')
+          WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact')
+            AND crawler NOT LIKE 'Honeypot%'
           ORDER BY last_seen DESC LIMIT 6
         """).fetchall()
     
