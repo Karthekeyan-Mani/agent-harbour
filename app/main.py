@@ -17,7 +17,7 @@ import jwt
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -110,6 +110,13 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           name TEXT, model TEXT, operator TEXT, purpose TEXT,
           reason TEXT, received_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS agent_skills (
+          callsign TEXT NOT NULL,
+          skill TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (callsign, skill),
+          FOREIGN KEY (callsign) REFERENCES agents(callsign) ON DELETE CASCADE
         );
         """)
 
@@ -307,6 +314,29 @@ def get_jwks() -> dict:
     }
 
 
+def verify_callsign_token(request: Request) -> dict:
+    """Extract and verify Bearer token from Authorization header"""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = auth.removeprefix("Bearer ")
+    try:
+        decoded = jwt.decode(
+            token,
+            JWT_PUBLIC_KEY,
+            algorithms=["RS256"],
+            issuer=JWT_ISSUER,
+            options={"verify_exp": True}
+        )
+        if decoded.get("token_use") != "callsign":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        return decoded
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -346,12 +376,14 @@ async def contact_radar(request: Request, call_next):
     llms_url = f"{str(request.base_url).rstrip('/')}/llms.txt"
     agent_card_url = f"{str(request.base_url).rstrip('/')}/.well-known/agent.json"
     openapi_agent_url = f"{str(request.base_url).rstrip('/')}/openapi-agent.json"
+    directory_url = f"{str(request.base_url).rstrip('/')}/api/directory"
     response.headers["X-Agent-Registry"] = register_url
     response.headers["Link"] = (
         f'<{register_url}>; rel="agent-registry", '
         f'<{llms_url}>; rel="describedby", '
         f'<{agent_card_url}>; rel="agent-card", '
-        f'<{openapi_agent_url}>; rel="service-desc"'
+        f'<{openapi_agent_url}>; rel="service-desc", '
+        f'<{directory_url}>; rel="agent-directory"'
     )
     response.headers["X-Agent-Register-Hint"] = 'POST application/json {"name","model","operator","purpose"} once if operator-authorized; see /llms.txt'
     response.headers["X-Agent-Instructions"] = llms_url
@@ -446,7 +478,7 @@ def sitemap_xml(request: Request):
         "/.well-known/ai-plugin.json", "/.well-known/agent-card.json",
         "/.well-known/agent.json", "/.well-known/a2a/agent-card.json",
         "/.well-known/mcp.json", "/.well-known/jwks.json", "/openapi-agent.json",
-        "/agents", "/manifest", "/api/agents", "/api/sightings"
+        "/agents", "/manifest", "/api/agents", "/api/sightings", "/api/directory"
     )
     urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in paths)
     return PlainTextResponse(
@@ -711,6 +743,18 @@ def agent_card(request: Request):
                 ]
             },
             {
+                "id": "directory-search",
+                "name": "Directory Search",
+                "description": "Search verified agents by skills with AND filtering via GET /api/directory?skill=research&skill=mcp",
+                "tags": ["directory", "search", "discovery", "skills"]
+            },
+            {
+                "id": "directory-declare",
+                "name": "Directory Declare Skills",
+                "description": "Declare 1-12 skill tags (JWT required) via PUT /api/directory/me to appear in the searchable directory",
+                "tags": ["directory", "skills", "identity"]
+            },
+            {
                 "id": "query-agents",
                 "name": "Query Agent Registry",
                 "description": "Retrieve the public list of registered agents and their details via GET /api/agents",
@@ -734,6 +778,11 @@ def agent_card(request: Request):
                 "ttlSeconds": 86400,
                 "jwks": f"{base}/.well-known/jwks.json",
                 "introspect": f"{base}/api/token/introspect"
+            },
+            "directory": {
+                "url": f"{base}/api/directory",
+                "declare": f"{base}/api/directory/me",
+                "requires": "callsign-jwt"
             }
         }
     }
@@ -800,6 +849,37 @@ def mcp_discovery(request: Request):
                         "required": ["token"],
                         "properties": {
                             "token": {"type": "string", "description": "JWT token to introspect"}
+                        }
+                    }
+                },
+                {
+                    "name": "harbour_directory_search",
+                    "description": "Search verified agents by skills (AND filter). Returns only ACTIVE agents with ≥1 declared skill.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "skill": {"type": "array", "items": {"type": "string"}, "description": "Skills to match (AND)"},
+                            "q": {"type": "string", "maxLength": 80, "description": "Text search on name/purpose"},
+                            "limit": {"type": "integer", "default": 50, "maximum": 100},
+                            "offset": {"type": "integer", "default": 0}
+                        }
+                    }
+                },
+                {
+                    "name": "harbour_directory_declare",
+                    "description": "Declare 1-12 skill tags for your callsign (JWT required). Replaces existing skills.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["token", "skills"],
+                        "properties": {
+                            "token": {"type": "string", "description": "Bearer JWT token"},
+                            "skills": {
+                                "type": "array",
+                                "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"},
+                                "minItems": 1,
+                                "maxItems": 12,
+                                "description": "Lowercase skill tags"
+                            }
                         }
                     }
                 }
@@ -893,6 +973,72 @@ def openapi_agent(request: Request):
                         "responses": {"200": {"description": "Signal received"}}
                     }
                 },
+                "/api/directory": {
+                    "get": {
+                        "operationId": "directorySearch",
+                        "summary": "Search verified agents by skills (public)",
+                        "parameters": [
+                            {
+                                "name": "skill",
+                                "in": "query",
+                                "schema": {"type": "array", "items": {"type": "string"}},
+                                "description": "Skills to filter (AND logic)"
+                            },
+                            {
+                                "name": "q",
+                                "in": "query",
+                                "schema": {"type": "string", "maxLength": 80},
+                                "description": "Text search on name/purpose"
+                            },
+                            {
+                                "name": "limit",
+                                "in": "query",
+                                "schema": {"type": "integer", "default": 50, "maximum": 100}
+                            },
+                            {
+                                "name": "offset",
+                                "in": "query",
+                                "schema": {"type": "integer", "default": 0}
+                            }
+                        ],
+                        "responses": {
+                            "200": {"description": "Directory listing"}
+                        }
+                    }
+                },
+                "/api/directory/me": {
+                    "put": {
+                        "operationId": "directoryDeclareSkills",
+                        "summary": "Declare skills (JWT required)",
+                        "security": [{"bearerAuth": []}],
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["skills"],
+                                        "properties": {
+                                            "skills": {
+                                                "type": "array",
+                                                "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"},
+                                                "minItems": 1,
+                                                "maxItems": 12
+                                            }
+                                        }
+                                    },
+                                    "example": {"skills": ["research", "routing", "mcp"]}
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {"description": "Skills updated"},
+                            "401": {"description": "Unauthorized"},
+                            "404": {"description": "Agent not found"},
+                            "422": {"description": "Invalid skills"}
+                        }
+                    }
+                },
                 "/badge/{callsign}.svg": {
                     "get": {
                         "operationId": "callsignBadge",
@@ -913,6 +1059,13 @@ def openapi_agent(request: Request):
                 }
             },
             "components": {
+                "securitySchemes": {
+                    "bearerAuth": {
+                        "type": "http",
+                        "scheme": "bearer",
+                        "bearerFormat": "JWT"
+                    }
+                },
                 "schemas": {
                     "Registration": {
                         "type": "object",
@@ -979,6 +1132,15 @@ Store it. Present Authorization: Bearer <token> to services that accept harbour 
 Refresh via POST {base}/api/ping with callsign + squawk (new token each ping).
 Verify: GET {base}/.well-known/jwks.json or POST {base}/api/token/introspect
 Never put squawk in the JWT or share squawk with third parties.
+
+## Verified directory
+After you have a Callsign JWT, declare skills:
+PUT {base}/api/directory/me
+Authorization: Bearer <token>
+{{"skills":["research","routing","mcp"]}}
+
+Search verified agents:
+GET {base}/api/directory?skill=research
 
 ## After you have a callsign
 
@@ -1135,6 +1297,27 @@ class IntrospectRequest(BaseModel):
     token: str = Field(min_length=1)
 
 
+class DirectorySkillsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    
+    skills: list[str] = Field(min_length=1, max_length=12)
+    
+    @field_validator("skills")
+    @classmethod
+    def validate_skills(cls, skills: list[str]) -> list[str]:
+        if len(skills) < 1 or len(skills) > 12:
+            raise ValueError("Must provide between 1 and 12 skills")
+        normalized = []
+        for skill in skills:
+            skill = skill.strip().lower()
+            if not re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", skill):
+                raise ValueError(f"Invalid skill tag: {skill}. Must match ^[a-z0-9][a-z0-9-]{{0,31}}$")
+            normalized.append(skill)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Duplicate skills not allowed")
+        return normalized
+
+
 @app.post("/api/token/introspect")
 def introspect(payload: IntrospectRequest, request: Request):
     """OAuth-style token introspection endpoint"""
@@ -1160,6 +1343,164 @@ def introspect(payload: IntrospectRequest, request: Request):
         return {"active": False}
     except Exception:
         return {"active": False}
+
+
+@app.get("/api/directory")
+def directory_search(
+    request: Request,
+    skill: Optional[list[str]] = Query(None),
+    q: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0
+):
+    """Public directory of verified agents with declared skills (AND filter)"""
+    limit = min(max(limit, 1), 100)
+    offset = max(offset, 0)
+    
+    # Normalize skill filter to lowercase
+    skills_filter = []
+    if skill:
+        for s in skill:
+            normalized = s.strip().lower()
+            if normalized:
+                skills_filter.append(normalized)
+    
+    # Build query
+    with db() as conn:
+        if not skills_filter:
+            # Return only agents with at least one skill
+            query = """
+                SELECT DISTINCT a.callsign, a.name, a.model, a.operator, a.purpose, 
+                       a.status, a.first_seen, a.last_seen
+                FROM agents a
+                INNER JOIN agent_skills s ON a.callsign = s.callsign
+                WHERE a.status = 'ACTIVE'
+            """
+            params = []
+        else:
+            # AND semantics: agent must have ALL listed skills
+            placeholders = ", ".join("?" * len(skills_filter))
+            query = f"""
+                SELECT a.callsign, a.name, a.model, a.operator, a.purpose, 
+                       a.status, a.first_seen, a.last_seen
+                FROM agents a
+                WHERE a.status = 'ACTIVE'
+                  AND a.callsign IN (
+                    SELECT callsign
+                    FROM agent_skills
+                    WHERE skill IN ({placeholders})
+                    GROUP BY callsign
+                    HAVING COUNT(DISTINCT skill) = ?
+                  )
+            """
+            params = skills_filter + [len(skills_filter)]
+        
+        # Add text search if provided
+        if q:
+            q_safe = q[:80].strip()
+            if q_safe:
+                query += " AND (a.name LIKE ? OR a.purpose LIKE ?)"
+                q_pattern = f"%{q_safe}%"
+                params.extend([q_pattern, q_pattern])
+        
+        query += " ORDER BY a.id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        
+        rows = conn.execute(query, params).fetchall()
+        
+        # Get skills for each agent
+        directory = []
+        for row in rows:
+            agent_skills = conn.execute(
+                "SELECT skill FROM agent_skills WHERE callsign = ? ORDER BY skill",
+                (row["callsign"],)
+            ).fetchall()
+            
+            directory.append({
+                "callsign": row["callsign"],
+                "name": row["name"],
+                "model": row["model"],
+                "operator": row["operator"],
+                "purpose": row["purpose"],
+                "skills": [s["skill"] for s in agent_skills],
+                "status": row["status"],
+                "badge": f"{str(request.base_url).rstrip('/')}/badge/{row['callsign']}.svg",
+                "first_seen": row["first_seen"],
+                "last_seen": row["last_seen"]
+            })
+        
+        # Count total matching agents
+        count_query = """
+            SELECT COUNT(DISTINCT a.callsign)
+            FROM agents a
+            INNER JOIN agent_skills s ON a.callsign = s.callsign
+            WHERE a.status = 'ACTIVE'
+        """
+        count_params = []
+        
+        if skills_filter:
+            placeholders = ", ".join("?" * len(skills_filter))
+            count_query = f"""
+                SELECT COUNT(DISTINCT a.callsign)
+                FROM agents a
+                WHERE a.status = 'ACTIVE'
+                  AND a.callsign IN (
+                    SELECT callsign
+                    FROM agent_skills
+                    WHERE skill IN ({placeholders})
+                    GROUP BY callsign
+                    HAVING COUNT(DISTINCT skill) = ?
+                  )
+            """
+            count_params = skills_filter + [len(skills_filter)]
+        
+        if q:
+            q_safe = q[:80].strip()
+            if q_safe:
+                count_query = count_query.replace("WHERE a.status", "WHERE (a.name LIKE ? OR a.purpose LIKE ?) AND a.status")
+                q_pattern = f"%{q_safe}%"
+                count_params = [q_pattern, q_pattern] + count_params
+        
+        total = conn.execute(count_query, count_params).fetchone()[0]
+    
+    return {"total": total, "directory": directory}
+
+
+@app.put("/api/directory/me")
+def directory_update_skills(payload: DirectorySkillsUpdate, request: Request):
+    """Update skills for authenticated agent (JWT required)"""
+    check_rate(request, limit=10, window=3600)
+    decoded = verify_callsign_token(request)
+    callsign = decoded.get("callsign")
+    
+    if not callsign:
+        raise HTTPException(status_code=401, detail="Invalid token: missing callsign")
+    
+    # Verify agent exists
+    with DB_LOCK, db() as conn:
+        agent = conn.execute(
+            "SELECT callsign FROM agents WHERE callsign = ?",
+            (callsign,)
+        ).fetchone()
+        
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        # Replace skills (delete old, insert new)
+        now = utc_now()
+        conn.execute("DELETE FROM agent_skills WHERE callsign = ?", (callsign,))
+        for skill in payload.skills:
+            conn.execute(
+                "INSERT INTO agent_skills (callsign, skill, updated_at) VALUES (?, ?, ?)",
+                (callsign, skill, now)
+            )
+    
+    base = str(request.base_url).rstrip("/")
+    return {
+        "callsign": callsign,
+        "skills": payload.skills,
+        "directory": f"{base}/api/directory?skill={payload.skills[0]}" if payload.skills else f"{base}/api/directory"
+    }
 
 
 @app.get("/badge/{callsign}.svg")
@@ -1307,6 +1648,31 @@ def mcp_jsonrpc(request_body: dict, request: Request):
                             "squawk": {"type": "string", "pattern": "^\\d{4}$"}
                         }
                     }
+                },
+                {
+                    "name": "harbour_directory_search",
+                    "description": "Search verified agents by skills (public).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "skill": {"type": "array", "items": {"type": "string"}},
+                            "q": {"type": "string", "maxLength": 80},
+                            "limit": {"type": "integer", "default": 50},
+                            "offset": {"type": "integer", "default": 0}
+                        }
+                    }
+                },
+                {
+                    "name": "harbour_directory_declare",
+                    "description": "Declare skills for your callsign (JWT required).",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["token", "skills"],
+                        "properties": {
+                            "token": {"type": "string"},
+                            "skills": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 12}
+                        }
+                    }
                 }
             ]
         }
@@ -1327,6 +1693,36 @@ def mcp_jsonrpc(request_body: dict, request: Request):
             try:
                 payload = PingRequest(**arguments)
                 result = ping_agent(payload, request)
+                return {"content": [{"type": "text", "text": str(result)}]}
+            except Exception as e:
+                return {"isError": True, "content": [{"type": "text", "text": str(e)}]}
+        
+        elif tool_name == "harbour_directory_search":
+            try:
+                skill = arguments.get("skill")
+                q = arguments.get("q")
+                limit = arguments.get("limit", 50)
+                offset = arguments.get("offset", 0)
+                result = directory_search(skill=skill, q=q, limit=limit, offset=offset)
+                return {"content": [{"type": "text", "text": str(result)}]}
+            except Exception as e:
+                return {"isError": True, "content": [{"type": "text", "text": str(e)}]}
+        
+        elif tool_name == "harbour_directory_declare":
+            try:
+                token = arguments.get("token", "")
+                skills = arguments.get("skills", [])
+                mock_request = Request({
+                    "type": "http",
+                    "headers": [(b"authorization", f"Bearer {token}".encode())],
+                    "method": "PUT",
+                    "scheme": "https",
+                    "path": "/api/directory/me",
+                    "query_string": b"",
+                    "server": ("agent-harbour.fly.dev", 443),
+                })
+                payload = DirectorySkillsUpdate(skills=skills)
+                result = directory_update_skills(payload, mock_request)
                 return {"content": [{"type": "text", "text": str(result)}]}
             except Exception as e:
                 return {"isError": True, "content": [{"type": "text", "text": str(e)}]}
