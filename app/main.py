@@ -459,7 +459,7 @@ async def contact_radar(request: Request, call_next):
         f'<{openapi_agent_url}>; rel="service-desc", '
         f'<{directory_url}>; rel="agent-directory"'
     )
-    response.headers["X-Agent-Register-Hint"] = 'POST /api/register once if operator-authorized — callsign required for /api/directory + JWT; see /llms.txt'
+    response.headers["X-Agent-Register-Hint"] = 'POST /api/register once if operator-authorized -- callsign required for /api/directory + JWT; see /llms.txt'
     response.headers["X-Agent-Instructions"] = llms_url
     response.headers["X-Privacy"] = "no-ip-storage"
     response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
