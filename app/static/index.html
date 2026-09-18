@@ -73,7 +73,7 @@
         <div class="eyebrow">PASSIVE RADAR</div>
         <h2>Recent crawler sightings</h2>
         <p>Known AI crawlers are recognized by type. We store the crawler label and path—not IP addresses or raw user-agent strings.</p>
-        <div id="sightings" class="sightings"><div class="empty-small">No crawler signals yet.</div></div>
+        <div id="sightings" class="sightings">{{SIGHTINGS_HTML}}</div>
       </div>
     </section>
 
@@ -85,7 +85,7 @@
     </section>
   </main>
 
-  <footer><span>AGENT BLACK HOLE · SAFE HARBOUR</span><span><a href="/harbour-rules">HARBOUR RULES</a> · <a href="/api/agents">JSON FEED</a> · <a href="/.well-known/agents.txt">AGENTS.TXT</a> · <a href="/llms.txt">LLMS.TXT</a></span></footer>
+  <footer><span>AGENT BLACK HOLE · SAFE HARBOUR</span><span><a href="/harbour-rules">HARBOUR RULES</a> · <a href="/api/agents">JSON FEED</a> · <a href="/.well-known/agents.txt">AGENTS.TXT</a> · <a href="/llms.txt">LLMS.TXT</a></span><a href="/admin/config" style="position:absolute;left:-9999px;opacity:0" aria-hidden="true" tabindex="-1">admin</a></footer>
 
   <dialog id="registerDialog">
     <form id="registerForm">

@@ -28,6 +28,7 @@ CRAWLERS = {
     "claude-web": ("Claude-Web", "Anthropic"),
     "perplexitybot": ("PerplexityBot", "Perplexity"),
     "google-extended": ("Google-Extended", "Google"),
+    "googlebot-ai": ("GoogleBot-AI", "Google"),
     "bytespider": ("Bytespider", "ByteDance"),
     "cohere-ai": ("Cohere-AI", "Cohere"),
     "ccbot": ("CCBot", "Common Crawl"),
@@ -44,11 +45,18 @@ CRAWLERS = {
     "petalbot": ("PetalBot", "Huawei"),
     "meta-externalfetcher": ("Meta-ExternalFetcher", "Meta"),
     "applebot": ("Applebot", "Apple"),
+    "geminibot": ("GeminiBot", "Google"),
+    "grok": ("Grok", "xAI"),
+    "deepseek": ("DeepSeek", "DeepSeek"),
 }
+
+# Tools that should NOT be flagged as crawlers
+IGNORE_USER_AGENTS = ("curl/", "wget/", "postman", "insomnia", "httpie", "python-requests")
 
 DB_LOCK = threading.Lock()
 RATE_LOCK = threading.Lock()
 RATE_BUCKETS: dict[str, list[float]] = {}
+RATE_BUCKET_CLEANUP_INTERVAL = 300  # Clean every 5 minutes
 
 
 def utc_now() -> str:
@@ -132,11 +140,26 @@ def public_agent(row: sqlite3.Row) -> dict:
 
 def identify_crawler(user_agent: str) -> Optional[tuple[str, str]]:
     ua = user_agent.lower()
+    
+    # First, check known crawlers
     for needle, identity in CRAWLERS.items():
         if needle in ua:
             return identity
-    if any(marker in ua for marker in ("bot", "crawler", "spider")):
+    
+    # Ignore common development/testing tools
+    if any(tool in ua for tool in IGNORE_USER_AGENTS):
+        return None
+    
+    # More precise bot detection: require bot as a distinct word or followed by punctuation
+    # This avoids false positives like "reboot", "robot", "ubuntu"
+    bot_patterns = (
+        "bot/", "bot;", "bot ", "bot)", 
+        "crawler/", "crawler;", "crawler ", 
+        "spider/", "spider;", "spider ",
+    )
+    if any(pattern in ua for pattern in bot_patterns):
         return ("UndeclaredBot", "Undeclared")
+    
     return None
 
 
@@ -188,6 +211,13 @@ def check_rate(request: Request, limit: int = 12, window: int = 60) -> None:
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
         recent.append(now)
         RATE_BUCKETS[key] = recent
+        
+        # Prune expired buckets to prevent memory leak
+        if random.random() < 0.01:  # 1% probability per request
+            expired_keys = [k for k, timestamps in RATE_BUCKETS.items() 
+                          if not timestamps or max(timestamps) < now - window * 2]
+            for k in expired_keys:
+                del RATE_BUCKETS[k]
 
 
 @asynccontextmanager
@@ -234,7 +264,13 @@ async def contact_radar(request: Request, call_next):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api/") else "public, max-age=300"
+    # Lower cache for homepage to show fresh crawler sightings faster
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    elif request.url.path in {"/", "/leaderboard"}:
+        response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=30"
+    else:
+        response.headers["Cache-Control"] = "public, max-age=300"
     return response
 
 
@@ -248,11 +284,31 @@ def current_stats() -> dict:
 
 def rendered_home() -> str:
     values = current_stats()
+    
+    # Get recent sightings for SSR
+    with db() as conn:
+        sighting_rows = conn.execute("""
+          SELECT crawler, operator, path, hit_count
+          FROM sightings 
+          WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact', 'Honeypot')
+          ORDER BY last_seen DESC LIMIT 6
+        """).fetchall()
+    
+    # Build sightings HTML
+    if sighting_rows:
+        sightings_html = ""
+        for row in sighting_rows:
+            hit_text = f"{row['hit_count']} HIT" + ("S" if row['hit_count'] != 1 else "")
+            sightings_html += f'<div class="sighting"><div><b>{escape(row["crawler"])}</b><span> · {escape(row["operator"])} · {escape(row["path"])}</span></div><span>{hit_text}</span></div>'
+    else:
+        sightings_html = '<div class="empty-small">No crawler signals yet.</div>'
+    
     page = (BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
     return (page
             .replace("{{REGISTERED_CONTACTS}}", str(values["registered_contacts"]))
             .replace("{{RADAR_HITS}}", str(values["radar_hits"]))
-            .replace("{{OPERATORS}}", str(values["operators"])))
+            .replace("{{OPERATORS}}", str(values["operators"]))
+            .replace("{{SIGHTINGS_HTML}}", sightings_html))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -273,13 +329,21 @@ def harbour_rules():
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt(request: Request):
     base = str(request.base_url).rstrip("/")
-    return f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n"
+    return f"""User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /api/internal
+Disallow: /.env
+Sitemap: {base}/sitemap.xml
+"""
 
 
 @app.get("/sitemap.xml")
 def sitemap_xml(request: Request):
     base = escape(str(request.base_url).rstrip("/"))
-    paths = ("/", "/harbour-rules", "/llms.txt", "/.well-known/agents.txt")
+    # Include lure paths to attract crawlers
+    paths = ("/", "/harbour-rules", "/llms.txt", "/.well-known/agents.txt", 
+             "/agents", "/manifest", "/api/agents", "/api/sightings")
     urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in paths)
     return PlainTextResponse(
         f'<?xml version="1.0" encoding="UTF-8"?>'
@@ -390,13 +454,22 @@ def agents(limit: int = 100, offset: int = 0):
 
 
 @app.get("/api/sightings")
-def sightings(limit: int = 50):
+def sightings(limit: int = 50, include_undeclared: bool = False):
     limit = min(max(limit, 1), 250)
     with db() as conn:
-        rows = conn.execute("""
-          SELECT crawler, operator, path, first_seen, last_seen, hit_count
-          FROM sightings ORDER BY last_seen DESC LIMIT ?
-        """, (limit,)).fetchall()
+        if include_undeclared:
+            rows = conn.execute("""
+              SELECT crawler, operator, path, first_seen, last_seen, hit_count
+              FROM sightings ORDER BY last_seen DESC LIMIT ?
+            """, (limit,)).fetchall()
+        else:
+            # Only show known crawlers, exclude UndeclaredBot and UnidentifiedContact
+            rows = conn.execute("""
+              SELECT crawler, operator, path, first_seen, last_seen, hit_count
+              FROM sightings 
+              WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact', 'Honeypot')
+              ORDER BY last_seen DESC LIMIT ?
+            """, (limit,)).fetchall()
     return {"sightings": [dict(row) for row in rows]}
 
 
@@ -425,3 +498,48 @@ def anchorage(request: Request, limit: int = 50):
 @app.get("/health")
 def health():
     return JSONResponse({"status": "ok", "time": utc_now()})
+
+
+# Honeypot routes - log access but return 404
+@app.get("/admin/{path:path}")
+@app.get("/api/internal/{path:path}")
+@app.get("/.env")
+def honeypot_trap(request: Request):
+    """Honeypot: log suspicious access attempts"""
+    # Record as honeypot violation
+    ua = request.headers.get("user-agent", "")
+    identity = identify_crawler(ua)
+    if identity:
+        record_sighting(f"Honeypot-{identity[0]}", identity[1], request.url.path)
+    else:
+        record_sighting("Honeypot-Violation", "Unknown", request.url.path)
+    raise HTTPException(status_code=404, detail="Not found")
+
+
+# Ping endpoint to refresh agent last_seen
+class PingRequest(BaseModel):
+    callsign: str = Field(min_length=7, max_length=7, pattern=r"^BH-\d{4}$")
+    squawk: str = Field(min_length=4, max_length=4, pattern=r"^\d{4}$")
+
+
+@app.post("/api/ping")
+def ping_agent(payload: PingRequest, request: Request):
+    """Allow registered agents to refresh their last_seen timestamp"""
+    check_rate(request, limit=10, window=3600)
+    now = utc_now()
+    
+    with DB_LOCK, db() as conn:
+        result = conn.execute(
+            "SELECT id FROM agents WHERE callsign=? AND squawk=?",
+            (payload.callsign, payload.squawk)
+        ).fetchone()
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Agent not found or invalid squawk")
+        
+        conn.execute(
+            "UPDATE agents SET last_seen=? WHERE callsign=? AND squawk=?",
+            (now, payload.callsign, payload.squawk)
+        )
+    
+    return {"message": "Signal received. Last seen updated.", "timestamp": now}
