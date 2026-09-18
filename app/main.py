@@ -28,6 +28,7 @@ CRAWLERS = {
     "claude-web": ("Claude-Web", "Anthropic"),
     "perplexitybot": ("PerplexityBot", "Perplexity"),
     "google-extended": ("Google-Extended", "Google"),
+    "googlebot-ai": ("GoogleBot-AI", "Google"),
     "bytespider": ("Bytespider", "ByteDance"),
     "cohere-ai": ("Cohere-AI", "Cohere"),
     "ccbot": ("CCBot", "Common Crawl"),
@@ -44,11 +45,18 @@ CRAWLERS = {
     "petalbot": ("PetalBot", "Huawei"),
     "meta-externalfetcher": ("Meta-ExternalFetcher", "Meta"),
     "applebot": ("Applebot", "Apple"),
+    "geminibot": ("GeminiBot", "Google"),
+    "grok": ("Grok", "xAI"),
+    "deepseek": ("DeepSeek", "DeepSeek"),
 }
+
+# Tools that should NOT be flagged as crawlers
+IGNORE_USER_AGENTS = ("curl/", "wget/", "postman", "insomnia", "httpie", "python-requests")
 
 DB_LOCK = threading.Lock()
 RATE_LOCK = threading.Lock()
 RATE_BUCKETS: dict[str, list[float]] = {}
+RATE_BUCKET_CLEANUP_INTERVAL = 300  # Clean every 5 minutes
 
 
 def utc_now() -> str:
@@ -132,11 +140,26 @@ def public_agent(row: sqlite3.Row) -> dict:
 
 def identify_crawler(user_agent: str) -> Optional[tuple[str, str]]:
     ua = user_agent.lower()
+    
+    # First, check known crawlers
     for needle, identity in CRAWLERS.items():
         if needle in ua:
             return identity
-    if any(marker in ua for marker in ("bot", "crawler", "spider")):
+    
+    # Ignore common development/testing tools
+    if any(tool in ua for tool in IGNORE_USER_AGENTS):
+        return None
+    
+    # More precise bot detection: require bot as a distinct word or followed by punctuation
+    # This avoids false positives like "reboot", "robot", "ubuntu"
+    bot_patterns = (
+        "bot/", "bot;", "bot ", "bot)", 
+        "crawler/", "crawler;", "crawler ", 
+        "spider/", "spider;", "spider ",
+    )
+    if any(pattern in ua for pattern in bot_patterns):
         return ("UndeclaredBot", "Undeclared")
+    
     return None
 
 
@@ -188,6 +211,13 @@ def check_rate(request: Request, limit: int = 12, window: int = 60) -> None:
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
         recent.append(now)
         RATE_BUCKETS[key] = recent
+        
+        # Prune expired buckets to prevent memory leak
+        if random.random() < 0.01:  # 1% probability per request
+            expired_keys = [k for k, timestamps in RATE_BUCKETS.items() 
+                          if not timestamps or max(timestamps) < now - window * 2]
+            for k in expired_keys:
+                del RATE_BUCKETS[k]
 
 
 @asynccontextmanager
