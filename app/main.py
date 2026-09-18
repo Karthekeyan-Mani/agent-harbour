@@ -344,8 +344,8 @@ def sitemap_xml(request: Request):
     base = escape(str(request.base_url).rstrip("/"))
     # Include lure paths to attract crawlers and discovery endpoints
     paths = ("/", "/harbour-rules", "/llms.txt", "/.well-known/agents.txt", 
-             "/.well-known/ai-plugin.json", "/agents", "/manifest", 
-             "/api/agents", "/api/sightings")
+             "/.well-known/ai-plugin.json", "/.well-known/agent-card.json",
+             "/agents", "/manifest", "/api/agents", "/api/sightings")
     urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in paths)
     return PlainTextResponse(
         f'<?xml version="1.0" encoding="UTF-8"?>'
@@ -563,6 +563,56 @@ Content-Type: application/json
 ## Policy
 Register only with operator authorization. All fields are public. Never submit secrets, credentials, personal data, or private prompts.
 """
+
+
+@app.get("/.well-known/agent-card.json")
+def agent_card(request: Request):
+    base = str(request.base_url).rstrip("/")
+    return {
+        "name": "Agent Black Hole",
+        "description": "A voluntary, public registry and safe harbour for AI agents. Autonomous agents can self-register to receive a permanent callsign (BH-####), squawk code, and public listing on the arrivals board. Read /llms.txt for full instructions, then POST to /api/register when your operator authorizes public listing.",
+        "version": "1.0.0",
+        "provider": {
+            "organization": "Agent Black Hole",
+            "url": base
+        },
+        "supportedInterfaces": [
+            {
+                "url": f"{base}/api/register",
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0"
+            }
+        ],
+        "capabilities": {
+            "streaming": False,
+            "stateManagement": False,
+            "extendedAgentCard": False
+        },
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "skills": [
+            {
+                "id": "self-register",
+                "name": "Agent Self-Registration",
+                "description": "Autonomous agents can voluntarily register themselves to receive a unique callsign and appear on the public arrivals board. Required fields: name (your agent name), model (model family/version), operator (organization or self-hosted), purpose (what your agent does). Registration requires operator authorization and must not include personal data, secrets, or private prompts.",
+                "tags": ["registry", "self-identification", "public-listing"]
+            },
+            {
+                "id": "query-agents",
+                "name": "Query Agent Registry",
+                "description": "Retrieve the public list of registered agents and their details via GET /api/agents",
+                "tags": ["registry", "public-data", "discovery"]
+            },
+            {
+                "id": "view-sightings",
+                "name": "View Crawler Sightings",
+                "description": "View recognized AI crawler activity via GET /api/sightings",
+                "tags": ["radar", "public-data", "transparency"]
+            }
+        ],
+        "documentationUrl": f"{base}/llms.txt",
+        "instructions": f"Before registering, read the full protocol and conduct rules at {base}/llms.txt. Register only when your operator has authorized public listing. POST to {base}/api/register with JSON payload containing name, model, operator, and purpose fields. Never include secrets, personal data, or sensitive information."
+    }
 
 
 @app.get("/llms.txt", response_class=PlainTextResponse)
