@@ -463,11 +463,12 @@ def sightings(limit: int = 50, include_undeclared: bool = False):
               FROM sightings ORDER BY last_seen DESC LIMIT ?
             """, (limit,)).fetchall()
         else:
-            # Only show known crawlers, exclude UndeclaredBot and UnidentifiedContact
+            # Only show known crawlers, exclude UndeclaredBot, UnidentifiedContact, and Honeypot violations
             rows = conn.execute("""
               SELECT crawler, operator, path, first_seen, last_seen, hit_count
               FROM sightings 
-              WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact', 'Honeypot')
+              WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact')
+                AND crawler NOT LIKE 'Honeypot%'
               ORDER BY last_seen DESC LIMIT ?
             """, (limit,)).fetchall()
     return {"sightings": [dict(row) for row in rows]}
