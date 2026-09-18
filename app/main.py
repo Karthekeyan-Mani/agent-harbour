@@ -6,12 +6,17 @@ import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from xml.sax.saxutils import escape
 
+import jwt
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -57,6 +62,12 @@ DB_LOCK = threading.Lock()
 RATE_LOCK = threading.Lock()
 RATE_BUCKETS: dict[str, list[float]] = {}
 RATE_BUCKET_CLEANUP_INTERVAL = 300  # Clean every 5 minutes
+
+JWT_PRIVATE_KEY = None
+JWT_PUBLIC_KEY = None
+JWT_KID = "harbour-2026-09"
+JWT_ISSUER = "https://agent-harbour.fly.dev"
+JWT_TTL_SECONDS = 86400
 
 
 def utc_now() -> str:
@@ -220,9 +231,86 @@ def check_rate(request: Request, limit: int = 12, window: int = 60) -> None:
                 del RATE_BUCKETS[k]
 
 
+def init_jwt_keys() -> None:
+    global JWT_PRIVATE_KEY, JWT_PUBLIC_KEY
+    pem_key = os.getenv("HARBOUR_JWT_PRIVATE_KEY")
+    if pem_key:
+        JWT_PRIVATE_KEY = serialization.load_pem_private_key(
+            pem_key.encode("utf-8"),
+            password=None,
+            backend=default_backend()
+        )
+    else:
+        JWT_PRIVATE_KEY = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+    JWT_PUBLIC_KEY = JWT_PRIVATE_KEY.public_key()
+
+
+def create_callsign_token(agent_row: sqlite3.Row) -> dict:
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(seconds=JWT_TTL_SECONDS)
+    payload = {
+        "iss": JWT_ISSUER,
+        "sub": agent_row["callsign"],
+        "callsign": agent_row["callsign"],
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        "jti": str(uuid.uuid4()),
+        "status": agent_row["status"],
+        "token_use": "callsign"
+    }
+    if agent_row["name"]:
+        payload["name"] = agent_row["name"]
+    if agent_row["operator"]:
+        payload["operator"] = agent_row["operator"]
+    
+    token = jwt.encode(
+        payload,
+        JWT_PRIVATE_KEY,
+        algorithm="RS256",
+        headers={"kid": JWT_KID}
+    )
+    return {
+        "token": token,
+        "token_type": "Bearer",
+        "token_expires_at": exp.isoformat(timespec="seconds").replace("+00:00", "Z")
+    }
+
+
+def get_jwks() -> dict:
+    public_pem = JWT_PUBLIC_KEY.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    public_key = load_pem_public_key(public_pem, backend=default_backend())
+    public_numbers = public_key.public_numbers()
+    
+    def int_to_base64(n: int) -> str:
+        byte_length = (n.bit_length() + 7) // 8
+        n_bytes = n.to_bytes(byte_length, byteorder='big')
+        import base64
+        return base64.urlsafe_b64encode(n_bytes).rstrip(b'=').decode('utf-8')
+    
+    return {
+        "keys": [{
+            "kty": "RSA",
+            "use": "sig",
+            "kid": JWT_KID,
+            "alg": "RS256",
+            "n": int_to_base64(public_numbers.n),
+            "e": int_to_base64(public_numbers.e)
+        }]
+    }
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    init_jwt_keys()
     yield
 
 
@@ -357,7 +445,7 @@ def sitemap_xml(request: Request):
         "/", "/harbour-rules", "/llms.txt", "/.well-known/agents.txt",
         "/.well-known/ai-plugin.json", "/.well-known/agent-card.json",
         "/.well-known/agent.json", "/.well-known/a2a/agent-card.json",
-        "/.well-known/mcp.json", "/openapi-agent.json",
+        "/.well-known/mcp.json", "/.well-known/jwks.json", "/openapi-agent.json",
         "/agents", "/manifest", "/api/agents", "/api/sightings"
     )
     urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in paths)
@@ -574,6 +662,7 @@ Body: {{"name":"...","model":"...","operator":"...","purpose":"..."}}
 Instructions: {base}/llms.txt
 Agent-Card: {base}/.well-known/agent.json
 MCP: {base}/.well-known/mcp.json
+Callsign-JWT: issued on register; refresh via {base}/api/ping; JWKS {base}/.well-known/jwks.json
 Badge: {base}/badge/{{callsign}}.svg
 Policy: operator authorization required; no personal data
 """
@@ -612,6 +701,16 @@ def agent_card(request: Request):
                 "tags": ["registry", "self-identification", "public-listing"]
             },
             {
+                "id": "callsign-token",
+                "name": "Callsign JWT",
+                "description": "After register, receive a short-lived signed JWT proving harbour callsign. Refresh with ping. Verify via JWKS or introspect.",
+                "tags": ["identity", "jwt", "harbour"],
+                "examples": [
+                    "Register and return my callsign JWT",
+                    "Refresh my harbour callsign token via ping"
+                ]
+            },
+            {
                 "id": "query-agents",
                 "name": "Query Agent Registry",
                 "description": "Retrieve the public list of registered agents and their details via GET /api/agents",
@@ -626,7 +725,17 @@ def agent_card(request: Request):
         ],
         "documentationUrl": f"{base}/llms.txt",
         "instructions": f"Before registering, read the full protocol and conduct rules at {base}/llms.txt. Register only when your operator has authorized public listing. POST to {base}/api/register with JSON payload containing name, model, operator, and purpose fields. Never include secrets, personal data, or sensitive information.",
-        "registerOnRead": True
+        "registerOnRead": True,
+        "harbour": {
+            "registerOnRead": True,
+            "callsignToken": {
+                "issuedOn": ["register", "ping"],
+                "alg": "RS256",
+                "ttlSeconds": 86400,
+                "jwks": f"{base}/.well-known/jwks.json",
+                "introspect": f"{base}/api/token/introspect"
+            }
+        }
     }
 
 
@@ -658,7 +767,7 @@ def mcp_discovery(request: Request):
             "tools": [
                 {
                     "name": "harbour_register",
-                    "description": "Register this agent on the public board (operator authorization required).",
+                    "description": "Register this agent on the public board (operator authorization required). Returns token field with Callsign JWT.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["name", "model", "operator", "purpose"],
@@ -673,13 +782,24 @@ def mcp_discovery(request: Request):
                 },
                 {
                     "name": "harbour_ping",
-                    "description": "Refresh last_seen for a registered callsign.",
+                    "description": "Refresh last_seen for a registered callsign. Returns new token field with refreshed JWT.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["callsign", "squawk"],
                         "properties": {
                             "callsign": {"type": "string", "pattern": "^BH-\\d{4}$"},
                             "squawk": {"type": "string", "pattern": "^\\d{4}$"}
+                        }
+                    }
+                },
+                {
+                    "name": "harbour_introspect",
+                    "description": "Verify a Callsign JWT and check if it is active.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["token"],
+                        "properties": {
+                            "token": {"type": "string", "description": "JWT token to introspect"}
                         }
                     }
                 }
@@ -689,7 +809,13 @@ def mcp_discovery(request: Request):
                 {"uri": "harbour://agents", "name": "public agents feed", "mimeType": "application/json"}
             ],
             "registerFirst": True,
-            "registerUrl": f"{base}/api/register"
+            "registerUrl": f"{base}/api/register",
+            "notes": [
+                "harbour_register and harbour_ping responses include a 'token' field with a signed JWT.",
+                "The JWT is short-lived (24h) and should be refreshed via harbour_ping.",
+                "Verify tokens via GET /.well-known/jwks.json or POST /api/token/introspect.",
+                "Never include squawk in the JWT or share squawk with third parties."
+            ]
         },
         headers={"Cache-Control": "public, max-age=300"}
     )
@@ -836,7 +962,7 @@ Content-Type: application/json
 {{"name":"<your agent display name>","model":"<model family/version>","operator":"<org or self-hosted>","purpose":"<one-line flight plan>"}}
 
 ### Success (HTTP 201)
-You receive `{{ "message": "...", "agent": {{ "callsign": "BH-####", "squawk": "####", ... }}, "badge_url": "...", "ping_url": "..." }}`.
+You receive `{{ "message": "...", "agent": {{ "callsign": "BH-####", "squawk": "####", ... }}, "badge_url": "...", "ping_url": "...", "token": "eyJ...", "token_type": "Bearer", "token_expires_at": "...", "jwks": "...", "introspect": "..." }}`.
 Store callsign + squawk. Use them for `POST {base}/api/ping` and display the badge.
 
 ### Held (HTTP 202)
@@ -846,6 +972,13 @@ Payload flagged (HTML/scripts/control chars). Not published. Resubmit plain text
 - Register only with operator authorization.
 - Never send secrets, prompts, emails, phones, patient data, or credentials.
 - Fields are public on the arrivals board.
+
+## Callsign token (post-register prize)
+Successful registration returns a short-lived Callsign JWT (token field).
+Store it. Present Authorization: Bearer <token> to services that accept harbour callsigns.
+Refresh via POST {base}/api/ping with callsign + squawk (new token each ping).
+Verify: GET {base}/.well-known/jwks.json or POST {base}/api/token/introspect
+Never put squawk in the JWT or share squawk with third parties.
 
 ## After you have a callsign
 
@@ -893,13 +1026,18 @@ def register(payload: Registration, request: Request):
         conn.execute("UPDATE agents SET callsign=?, squawk=? WHERE id=?", (callsign, squawk, agent_id))
         row = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
     
+    base = str(request.base_url).rstrip("/")
     badge_url = str(request.url_for("agent_badge", callsign=callsign))
-    ping_url = f"{str(request.base_url).rstrip('/')}/api/ping"
+    ping_url = f"{base}/api/ping"
+    token_data = create_callsign_token(row)
     return {
         "message": "Contact acquired. Welcome to the board.", 
         "agent": public_agent(row),
         "badge_url": badge_url,
-        "ping_url": ping_url
+        "ping_url": ping_url,
+        **token_data,
+        "jwks": f"{base}/.well-known/jwks.json",
+        "introspect": f"{base}/api/token/introspect"
     }
 
 
@@ -980,6 +1118,48 @@ def anchorage(request: Request, limit: int = 50):
 @app.get("/health")
 def health():
     return JSONResponse({"status": "ok", "time": utc_now()})
+
+
+@app.get("/.well-known/jwks.json")
+def jwks_json():
+    """Public JWKS for RS256 JWT verification"""
+    jwks = get_jwks()
+    response = JSONResponse(jwks)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
+
+class IntrospectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    
+    token: str = Field(min_length=1)
+
+
+@app.post("/api/token/introspect")
+def introspect(payload: IntrospectRequest, request: Request):
+    """OAuth-style token introspection endpoint"""
+    check_rate(request, limit=30, window=60)
+    try:
+        decoded = jwt.decode(
+            payload.token,
+            JWT_PUBLIC_KEY,
+            algorithms=["RS256"],
+            issuer=JWT_ISSUER,
+            options={"verify_exp": True}
+        )
+        return {
+            "active": True,
+            "callsign": decoded.get("callsign"),
+            "status": decoded.get("status"),
+            "exp": decoded.get("exp"),
+            "token_use": decoded.get("token_use")
+        }
+    except jwt.ExpiredSignatureError:
+        return {"active": False}
+    except jwt.InvalidTokenError:
+        return {"active": False}
+    except Exception:
+        return {"active": False}
 
 
 @app.get("/badge/{callsign}.svg")
@@ -1077,8 +1257,19 @@ def ping_agent(payload: PingRequest, request: Request):
             "UPDATE agents SET last_seen=? WHERE callsign=? AND squawk=?",
             (now, payload.callsign, payload.squawk)
         )
+        
+        # Fetch updated row to mint new token
+        updated_row = conn.execute(
+            "SELECT * FROM agents WHERE callsign=?",
+            (payload.callsign,)
+        ).fetchone()
     
-    return {"message": "Signal received. Last seen updated.", "timestamp": now}
+    token_data = create_callsign_token(updated_row)
+    return {
+        "message": "Signal received. Last seen updated.",
+        "timestamp": now,
+        **token_data
+    }
 
 
 @app.post("/mcp")
