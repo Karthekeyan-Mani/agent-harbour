@@ -1818,21 +1818,7 @@ def site_dashboard(site_id: int, request: Request):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{escape(site["name"])} - Agent Black Hole Sensor</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1f1c; color: #e8fff8; margin: 0; padding: 20px; }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        h1 {{ color: #8dffce; margin-bottom: 10px; }}
-        .stats {{ display: flex; gap: 20px; margin: 20px 0; }}
-        .stat {{ background: #1c3a35; padding: 15px 20px; border-radius: 8px; flex: 1; }}
-        .stat-value {{ font-size: 28px; font-weight: bold; color: #8dffce; }}
-        .stat-label {{ font-size: 14px; color: #b3ccc4; margin-top: 5px; }}
-        .sighting {{ background: #1c3a35; padding: 15px; margin: 10px 0; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }}
-        .sighting b {{ color: #8dffce; }}
-        .sighting span {{ color: #b3ccc4; }}
-        .empty-small {{ text-align: center; padding: 40px; color: #6b8680; }}
-        a {{ color: #8dffce; text-decoration: none; }}
-        a:hover {{ text-decoration: underline; }}
-    </style>
+    <link rel="stylesheet" href="/static/site-dashboard.css">
 </head>
 <body>
     <div class="container">
