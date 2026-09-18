@@ -51,12 +51,18 @@ CRAWLERS = {
     "meta-externalfetcher": ("Meta-ExternalFetcher", "Meta"),
     "applebot": ("Applebot", "Apple"),
     "geminibot": ("GeminiBot", "Google"),
-    "grok": ("Grok", "xAI"),
     "deepseek": ("DeepSeek", "DeepSeek"),
 }
 
-# Tools that should NOT be flagged as crawlers
-IGNORE_USER_AGENTS = ("curl/", "wget/", "postman", "insomnia", "httpie", "python-requests")
+# Short needles that require word-boundary matching to avoid false positives
+SHORT_NEEDLES_REQUIRE_BOUNDARY = {"grok"}
+
+# Tools and self-traffic that should NOT be flagged as crawlers
+IGNORE_USER_AGENTS = (
+    "curl/", "wget/", "postman", "insomnia", "httpie", "python-requests",
+    "grok bot",  # Cursor's Grok Bot (note: lowercase for matching)
+    "cursor",    # Cursor IDE/agent traffic
+)
 
 DB_LOCK = threading.Lock()
 RATE_LOCK = threading.Lock()
@@ -174,19 +180,60 @@ def public_agent(row: sqlite3.Row) -> dict:
     }
 
 
-def identify_crawler(user_agent: str) -> Optional[tuple[str, str]]:
+def identify_crawler(user_agent: str, self_header: Optional[str] = None, fleet_header: Optional[str] = None) -> Optional[tuple[str, str]]:
+    """
+    Identify crawler from user agent and optional self-attribution headers.
+    
+    Args:
+        user_agent: The User-Agent header value
+        self_header: Optional X-Harbour-Self header (agent slug for self-fleet)
+        fleet_header: Optional X-Harbour-Fleet header (fleet identifier)
+    
+    Returns:
+        Tuple of (crawler_name, operator) or None if not a crawler
+    """
+    # Priority 1: Self-fleet attribution via headers (Harbour's own agents)
+    if self_header:
+        # Sanitize the slug to prevent injection
+        slug = re.sub(r'[^a-zA-Z0-9_-]', '', self_header[:50])
+        if slug:
+            return (f"Self-{slug}", "GrokBotFleet")
+    
+    if fleet_header and fleet_header.lower() in ("grokbot", "harbour"):
+        return ("Self-internal", "GrokBotFleet")
+    
     ua = user_agent.lower()
     
-    # First, check known crawlers
-    for needle, identity in CRAWLERS.items():
-        if needle in ua:
-            return identity
-    
-    # Ignore common development/testing tools
+    # Priority 2: Ignore known development/testing tools and self-traffic
     if any(tool in ua for tool in IGNORE_USER_AGENTS):
         return None
     
-    # More precise bot detection: require bot as a distinct word or followed by punctuation
+    # Priority 3: Check known crawlers with word-boundary awareness
+    for needle, identity in CRAWLERS.items():
+        if needle in ua:
+            # Short needles require word-boundary matching to avoid false positives
+            if needle in SHORT_NEEDLES_REQUIRE_BOUNDARY:
+                # Match "needle/" "needle;" "needle " "needle-" or at start/end of string
+                # This prevents "grok" from matching "Grok Bot" but matches "xai-grok/1.0"
+                word_boundary_patterns = (
+                    f" {needle}/", f" {needle};", f" {needle} ", f" {needle}-",
+                    f"/{needle}/", f"/{needle};", f"/{needle} ", f"/{needle}-",
+                    f"-{needle}/", f"-{needle};", f"-{needle} ", f"-{needle}-",
+                )
+                # Also check if it's at the start or end with appropriate boundaries
+                if (ua.startswith(f"{needle}/") or ua.startswith(f"{needle};") or 
+                    ua.startswith(f"{needle} ") or ua.startswith(f"{needle}-") or
+                    ua.endswith(f"/{needle}") or ua.endswith(f" {needle}") or
+                    any(pattern in ua for pattern in word_boundary_patterns)):
+                    return identity
+                # If no word boundary match, skip this needle
+                continue
+            else:
+                # Regular substring match for long needles
+                return identity
+    
+    # Priority 4: Undeclared bot detection with precise patterns
+    # Require bot as a distinct word or followed by punctuation
     # This avoids false positives like "reboot", "robot", "ubuntu"
     bot_patterns = (
         "bot/", "bot;", "bot ", "bot)", 
@@ -383,7 +430,16 @@ async def contact_radar(request: Request, call_next):
                 response = JSONResponse(status_code=413, content={"detail": "Registration payload too large"})
         except ValueError:
             response = JSONResponse(status_code=400, content={"detail": "Invalid content length"})
-    identity = identify_crawler(request.headers.get("user-agent", ""))
+    
+    # Check for self-fleet attribution headers
+    self_header = request.headers.get("x-harbour-self")
+    fleet_header = request.headers.get("x-harbour-fleet")
+    
+    identity = identify_crawler(
+        request.headers.get("user-agent", ""),
+        self_header=self_header,
+        fleet_header=fleet_header
+    )
     if identity:
         record_sighting(identity[0], identity[1], request.url.path)
     elif request.url.path in {"/agents", "/manifest"}:
@@ -433,12 +489,14 @@ def current_stats() -> dict:
 def rendered_home() -> str:
     values = current_stats()
     
-    # Get recent sightings for SSR
+    # Get recent sightings for SSR (exclude self-fleet by default)
     with db() as conn:
         sighting_rows = conn.execute("""
           SELECT crawler, operator, path, hit_count
           FROM sightings 
           WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact')
+            AND crawler NOT LIKE 'Self-%'
+            AND operator != 'GrokBotFleet'
             AND crawler NOT LIKE 'Honeypot%'
           ORDER BY last_seen DESC LIMIT 6
         """).fetchall()
@@ -1258,20 +1316,43 @@ def agents(limit: int = 100, offset: int = 0):
 
 
 @app.get("/api/sightings")
-def sightings(limit: int = 50, include_undeclared: bool = False):
+def sightings(limit: int = 50, include_undeclared: bool = False, include_self: bool = False):
     limit = min(max(limit, 1), 250)
     with db() as conn:
-        if include_undeclared:
+        if include_undeclared and include_self:
+            # Show everything
             rows = conn.execute("""
               SELECT crawler, operator, path, first_seen, last_seen, hit_count
               FROM sightings ORDER BY last_seen DESC LIMIT ?
             """, (limit,)).fetchall()
-        else:
-            # Only show known crawlers, exclude UndeclaredBot, UnidentifiedContact, and Honeypot violations
+        elif include_undeclared:
+            # Show undeclared but exclude self-fleet
+            rows = conn.execute("""
+              SELECT crawler, operator, path, first_seen, last_seen, hit_count
+              FROM sightings 
+              WHERE crawler NOT LIKE 'Self-%'
+                AND operator != 'GrokBotFleet'
+                AND crawler NOT LIKE 'Honeypot%'
+              ORDER BY last_seen DESC LIMIT ?
+            """, (limit,)).fetchall()
+        elif include_self:
+            # Show self-fleet but exclude undeclared/unidentified
             rows = conn.execute("""
               SELECT crawler, operator, path, first_seen, last_seen, hit_count
               FROM sightings 
               WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact')
+                AND crawler NOT LIKE 'Honeypot%'
+              ORDER BY last_seen DESC LIMIT ?
+            """, (limit,)).fetchall()
+        else:
+            # Default: Only show known external crawlers
+            # Exclude UndeclaredBot, UnidentifiedContact, Self-fleet, and Honeypot
+            rows = conn.execute("""
+              SELECT crawler, operator, path, first_seen, last_seen, hit_count
+              FROM sightings 
+              WHERE crawler NOT IN ('UndeclaredBot', 'UnidentifiedContact')
+                AND crawler NOT LIKE 'Self-%'
+                AND operator != 'GrokBotFleet'
                 AND crawler NOT LIKE 'Honeypot%'
               ORDER BY last_seen DESC LIMIT ?
             """, (limit,)).fetchall()
@@ -1588,7 +1669,9 @@ def honeypot_trap(request: Request):
     """Honeypot: log suspicious access attempts"""
     # Record as honeypot violation
     ua = request.headers.get("user-agent", "")
-    identity = identify_crawler(ua)
+    self_header = request.headers.get("x-harbour-self")
+    fleet_header = request.headers.get("x-harbour-fleet")
+    identity = identify_crawler(ua, self_header=self_header, fleet_header=fleet_header)
     if identity:
         record_sighting(f"Honeypot-{identity[0]}", identity[1], request.url.path)
     else:
@@ -1722,8 +1805,8 @@ def ingest_site_sighting(site_id: int, payload: SiteSightingIngest, request: Req
         crawler = payload.crawler[:120]
         operator = payload.operator[:120]
     elif payload.ua:
-        # Server-side classification using existing logic
-        identity = identify_crawler(payload.ua)
+        # Server-side classification using existing logic (no self-fleet headers for external sensors)
+        identity = identify_crawler(payload.ua, self_header=None, fleet_header=None)
         if identity:
             crawler, operator = identity
         else:
