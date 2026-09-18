@@ -111,6 +111,24 @@ def init_db() -> None:
           name TEXT, model TEXT, operator TEXT, purpose TEXT,
           reason TEXT, received_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS sites (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          ingest_key_hash TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS site_sightings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          site_id INTEGER NOT NULL,
+          crawler_label TEXT NOT NULL,
+          operator_label TEXT NOT NULL,
+          path TEXT NOT NULL,
+          hit_count INTEGER DEFAULT 1,
+          first_seen TEXT NOT NULL,
+          last_seen TEXT NOT NULL,
+          FOREIGN KEY(site_id) REFERENCES sites(id),
+          UNIQUE(site_id, crawler_label, path)
+        );
         CREATE TABLE IF NOT EXISTS agent_skills (
           callsign TEXT NOT NULL,
           skill TEXT NOT NULL,
@@ -455,6 +473,11 @@ def leaderboard():
 @app.get("/harbour-rules", response_class=HTMLResponse)
 def harbour_rules():
     return FileResponse(BASE_DIR / "static" / "harbour-rules.html")
+
+
+@app.get("/sensor", response_class=HTMLResponse)
+def sensor_docs():
+    return FileResponse(BASE_DIR / "static" / "sensor.html")
 
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
@@ -1579,6 +1602,28 @@ class PingRequest(BaseModel):
     squawk: str = Field(min_length=4, max_length=4, pattern=r"^\d{4}$")
 
 
+# Sensor site models
+class SiteCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        value = compact(value)
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+
+class SiteSightingIngest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    crawler: Optional[str] = Field(None, max_length=120)
+    operator: Optional[str] = Field(None, max_length=120)
+    ua: Optional[str] = Field(None, max_length=500)
+    path: str = Field(min_length=1, max_length=500)
+
+
 @app.post("/api/ping")
 def ping_agent(payload: PingRequest, request: Request):
     """Allow registered agents to refresh their last_seen timestamp"""
@@ -1611,6 +1656,211 @@ def ping_agent(payload: PingRequest, request: Request):
         "timestamp": now,
         **token_data
     }
+
+
+@app.post("/api/sites", status_code=201)
+def create_site(payload: SiteCreate, request: Request):
+    """Create a new site and return site_id + plaintext ingest key"""
+    check_rate(request, limit=5, window=3600)
+    now = utc_now()
+    
+    # Generate a secure random ingest key
+    ingest_key = secrets.token_urlsafe(32)
+    key_hash = hashlib.sha256(ingest_key.encode()).hexdigest()
+    
+    with DB_LOCK, db() as conn:
+        cur = conn.execute(
+            "INSERT INTO sites(name, ingest_key_hash, created_at) VALUES (?, ?, ?)",
+            (payload.name, key_hash, now)
+        )
+        site_id = cur.lastrowid
+    
+    # Return the plaintext key once
+    return {
+        "site_id": site_id,
+        "name": payload.name,
+        "ingest_key": ingest_key,
+        "warning": "Store this ingest key securely. It will not be shown again.",
+        "ingest_url": f"{str(request.base_url).rstrip('/')}/api/sites/{site_id}/sightings",
+        "sightings_url": f"{str(request.base_url).rstrip('/')}/api/sites/{site_id}/sightings",
+        "dashboard_url": f"{str(request.base_url).rstrip('/')}/sites/{site_id}",
+    }
+
+
+def verify_site_key(site_id: int, request: Request) -> None:
+    """Verify the ingest key for a site from Authorization header or X-Harbour-Ingest-Key"""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        provided_key = auth_header[7:]
+    else:
+        provided_key = request.headers.get("x-harbour-ingest-key", "")
+    
+    if not provided_key:
+        raise HTTPException(status_code=401, detail="Missing ingest key")
+    
+    key_hash = hashlib.sha256(provided_key.encode()).hexdigest()
+    
+    with db() as conn:
+        site = conn.execute(
+            "SELECT id FROM sites WHERE id=? AND ingest_key_hash=?",
+            (site_id, key_hash)
+        ).fetchone()
+    
+    if not site:
+        raise HTTPException(status_code=403, detail="Invalid site or ingest key")
+
+
+@app.post("/api/sites/{site_id}/sightings", status_code=201)
+def ingest_site_sighting(site_id: int, payload: SiteSightingIngest, request: Request):
+    """Ingest a site sighting (requires ingest key)"""
+    verify_site_key(site_id, request)
+    check_rate(request, limit=100, window=60)
+    
+    # Determine crawler and operator
+    if payload.crawler and payload.operator:
+        # Use provided labels
+        crawler = payload.crawler[:120]
+        operator = payload.operator[:120]
+    elif payload.ua:
+        # Server-side classification using existing logic
+        identity = identify_crawler(payload.ua)
+        if identity:
+            crawler, operator = identity
+        else:
+            # Not a recognized crawler, ignore
+            return {"message": "Not a recognized crawler"}
+    else:
+        raise HTTPException(status_code=400, detail="Either (crawler, operator) or ua must be provided")
+    
+    # Normalize path
+    safe_path = payload.path[:500]
+    # Strip query string for privacy
+    if "?" in safe_path:
+        safe_path = safe_path.split("?")[0]
+    
+    now = utc_now()
+    
+    with DB_LOCK, db() as conn:
+        conn.execute("""
+            INSERT INTO site_sightings(site_id, crawler_label, operator_label, path, first_seen, last_seen, hit_count)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(site_id, crawler_label, path) DO UPDATE SET
+                last_seen=excluded.last_seen,
+                hit_count=site_sightings.hit_count+1
+        """, (site_id, crawler, operator, safe_path, now, now))
+    
+    return {"message": "Sighting recorded", "crawler": crawler, "path": safe_path}
+
+
+@app.get("/api/sites/{site_id}/sightings")
+def get_site_sightings(site_id: int, request: Request, limit: int = 100):
+    """Get sightings for a site (requires ingest key)"""
+    verify_site_key(site_id, request)
+    limit = min(max(limit, 1), 500)
+    
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT crawler_label, operator_label, path, first_seen, last_seen, hit_count
+            FROM site_sightings
+            WHERE site_id=?
+            ORDER BY last_seen DESC
+            LIMIT ?
+        """, (site_id, limit)).fetchall()
+    
+    return {"site_id": site_id, "sightings": [dict(row) for row in rows]}
+
+
+@app.get("/sites/{site_id}")
+def site_dashboard(site_id: int, request: Request):
+    """Public dashboard for site sightings (requires ingest key)"""
+    verify_site_key(site_id, request)
+    
+    with db() as conn:
+        site = conn.execute("SELECT name, created_at FROM sites WHERE id=?", (site_id,)).fetchone()
+        if not site:
+            raise HTTPException(status_code=404, detail="Site not found")
+        
+        rows = conn.execute("""
+            SELECT crawler_label, operator_label, path, first_seen, last_seen, hit_count
+            FROM site_sightings
+            WHERE site_id=?
+            ORDER BY last_seen DESC
+            LIMIT 100
+        """, (site_id,)).fetchall()
+        
+        total_hits = conn.execute("""
+            SELECT COALESCE(SUM(hit_count), 0) FROM site_sightings WHERE site_id=?
+        """, (site_id,)).fetchone()[0]
+        
+        unique_crawlers = conn.execute("""
+            SELECT COUNT(DISTINCT crawler_label) FROM site_sightings WHERE site_id=?
+        """, (site_id,)).fetchone()[0]
+    
+    # Build simple HTML dashboard
+    sightings_html = ""
+    if rows:
+        for row in rows:
+            hit_text = f"{row['hit_count']} HIT" + ("S" if row['hit_count'] != 1 else "")
+            sightings_html += f'''
+            <div class="sighting">
+                <div>
+                    <b>{escape(row["crawler_label"])}</b>
+                    <span> · {escape(row["operator_label"])} · {escape(row["path"])}</span>
+                </div>
+                <span>{hit_text}</span>
+            </div>'''
+    else:
+        sightings_html = '<div class="empty-small">No crawler sightings yet.</div>'
+    
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{escape(site["name"])} - Agent Black Hole Sensor</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1f1c; color: #e8fff8; margin: 0; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        h1 {{ color: #8dffce; margin-bottom: 10px; }}
+        .stats {{ display: flex; gap: 20px; margin: 20px 0; }}
+        .stat {{ background: #1c3a35; padding: 15px 20px; border-radius: 8px; flex: 1; }}
+        .stat-value {{ font-size: 28px; font-weight: bold; color: #8dffce; }}
+        .stat-label {{ font-size: 14px; color: #b3ccc4; margin-top: 5px; }}
+        .sighting {{ background: #1c3a35; padding: 15px; margin: 10px 0; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }}
+        .sighting b {{ color: #8dffce; }}
+        .sighting span {{ color: #b3ccc4; }}
+        .empty-small {{ text-align: center; padding: 40px; color: #6b8680; }}
+        a {{ color: #8dffce; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>{escape(site["name"])}</h1>
+        <p>Agent Black Hole Sensor Dashboard · <a href="/sensor">Install Guide</a> · <a href="/">Main Board</a></p>
+        
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-value">{total_hits}</div>
+                <div class="stat-label">Total Hits</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{unique_crawlers}</div>
+                <div class="stat-label">Unique Crawlers</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{len(rows)}</div>
+                <div class="stat-label">Path × Crawler Combinations</div>
+            </div>
+        </div>
+        
+        <h2>Recent Sightings</h2>
+        {sightings_html}
+    </div>
+</body>
+</html>'''
+    
+    return HTMLResponse(html)
 
 
 @app.post("/mcp")
