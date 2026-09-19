@@ -333,6 +333,38 @@ def test_api_endpoints():
     assert hint.isascii(), "X-Agent-Register-Hint must be ASCII-only"
     print(f"✓ X-Agent-Register-Hint is ASCII: {hint[:50]}...")
     
+    # Test 12: Public proof endpoint for bound agent
+    print("\n12. Testing GET /api/ceremony/{callsign} for bound agent...")
+    response = client.get(f"/api/ceremony/{signed_callsign}")
+    assert response.status_code == 200, f"Ceremony proof failed: {response.status_code}"
+    proof = response.json()
+    assert proof["callsign"] == signed_callsign, "Callsign mismatch"
+    assert proof["key_bound"] == True, "Should be key_bound"
+    assert "ed25519_pubkey" in proof, "Missing ed25519_pubkey"
+    assert "pubkey_fp" in proof, "Missing pubkey_fp"
+    assert "glyph_compat" in proof, "Missing glyph_compat"
+    assert "bound_at" in proof, "Missing bound_at"
+    print(f"✓ Public proof for bound agent: {signed_callsign}")
+    
+    # Test 13: Public proof endpoint for unbound agent
+    print("\n13. Testing GET /api/ceremony/{callsign} for unbound agent...")
+    # Get the unsigned agent callsign from test 2
+    unbound_callsign = "BH-0001"
+    response = client.get(f"/api/ceremony/{unbound_callsign}")
+    assert response.status_code == 200, f"Ceremony proof failed: {response.status_code}"
+    proof = response.json()
+    assert proof["callsign"] == unbound_callsign, "Callsign mismatch"
+    assert proof["key_bound"] == False, "Should not be key_bound"
+    assert "ed25519_pubkey" not in proof, "Should not include pubkey for unbound agent"
+    assert "pubkey_fp" not in proof, "Should not include pubkey_fp for unbound agent"
+    print(f"✓ Public proof for unbound agent: {unbound_callsign}")
+    
+    # Test 14: Public proof endpoint for unknown agent
+    print("\n14. Testing GET /api/ceremony/{callsign} for unknown agent...")
+    response = client.get("/api/ceremony/BH-9999")
+    assert response.status_code == 404, f"Unknown agent should return 404, got {response.status_code}"
+    print("✓ Unknown agent correctly returns 404")
+    
     print("\n" + "="*60)
     print("✓ ALL TESTS PASSED!")
     print("="*60)

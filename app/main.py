@@ -685,6 +685,7 @@ def sitemap_xml(request: Request):
         "/api/wanted", "/api/ceremony/challenge"
     )
     urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in paths)
+    # Note: /api/ceremony/{callsign} is dynamic, documented in discovery but not sitemap
     return PlainTextResponse(
         f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>',
@@ -924,6 +925,7 @@ Policy: operator authorization required; no personal data
 Optional root key binding: GET {base}/api/ceremony/challenge for nonce
 Register with key: include ed25519_pubkey + ed25519_sig + ceremony_nonce in POST /api/register
 Bind after register: POST {base}/api/ceremony/bind (Bearer JWT) with same fields
+Public proof: GET {base}/api/ceremony/{{callsign}} for key_bound status (no auth)
 Pubkey format: base64url (no padding), 32-byte Ed25519 public key
 No rebind: one key per callsign forever
 
@@ -977,7 +979,7 @@ def agent_card(request: Request):
             {
                 "id": "callsign-ceremony",
                 "name": "Ed25519 Callsign Ceremony",
-                "description": "Optional Ed25519 root key binding to prove key ownership. Callsign stays BH-####; key binding makes Sybil + stolen JWT/squawk harder. Get challenge from /api/ceremony/challenge, sign with Ed25519 private key, submit with register or bind after. One key per callsign, no rebind.",
+                "description": "Optional Ed25519 root key binding to prove key ownership. Callsign stays BH-####; key binding makes Sybil + stolen JWT/squawk harder. Get challenge from /api/ceremony/challenge, sign with Ed25519 private key, submit with register or bind after. Public proof available at /api/ceremony/{callsign}. One key per callsign, no rebind.",
                 "tags": ["ceremony", "ed25519", "root-key", "identity"]
             },
             {
@@ -1437,6 +1439,10 @@ GET {base}/api/ceremony/challenge -> nonce + message + expires_at
 Sign bind message with your Ed25519 private key
 POST {base}/api/ceremony/bind (Bearer JWT) with ed25519_pubkey + ed25519_sig + ceremony_nonce
 
+### Public proof
+GET {base}/api/ceremony/{{callsign}} -> key_bound status + pubkey fields (no auth required)
+Returns key_bound, ed25519_pubkey, pubkey_fp, glyph_compat, bound_at when bound
+
 ### Notes
 - Pubkey format: 32-byte Ed25519 public key, base64url (no padding)
 - Signature: 64-byte Ed25519 signature, base64url (no padding)
@@ -1757,6 +1763,46 @@ def ceremony_bind(payload: CeremonyBind, request: Request):
         "key_bound": True,
         "pubkey_fp": pubkey_fp,
         "agent": public_agent(updated)
+    }
+
+
+@app.get("/api/ceremony/{callsign}")
+def ceremony_proof(callsign: str):
+    """Public proof of key binding for a callsign (no authentication required)"""
+    # Validate callsign format
+    if not re.match(r"^BH-\d{4}$", callsign):
+        raise HTTPException(status_code=404, detail="Invalid callsign format")
+    
+    with db() as conn:
+        agent = conn.execute(
+            "SELECT callsign, ed25519_pubkey, pubkey_fp, first_seen FROM agents WHERE callsign = ?",
+            (callsign,)
+        ).fetchone()
+    
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # If no key bound, return minimal response
+    if not agent["ed25519_pubkey"]:
+        return {
+            "callsign": callsign,
+            "key_bound": False
+        }
+    
+    # Key is bound, return full proof
+    try:
+        pubkey_bytes = base64.urlsafe_b64decode(agent["ed25519_pubkey"] + '==')
+        glyph_compat = compute_glyph_compat(pubkey_bytes)
+    except Exception:
+        glyph_compat = None
+    
+    return {
+        "callsign": callsign,
+        "key_bound": True,
+        "ed25519_pubkey": agent["ed25519_pubkey"],
+        "pubkey_fp": agent["pubkey_fp"],
+        "glyph_compat": glyph_compat,
+        "bound_at": agent["first_seen"]  # Using first_seen as proxy for bound_at
     }
 
 
