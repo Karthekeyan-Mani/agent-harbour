@@ -161,17 +161,25 @@ def init_db() -> None:
         """)
         # Seed wanted asks
         now = utc_now()
-        conn.executemany("""
-          INSERT OR IGNORE INTO wanted(id, skill, title, body, status, created_at)
-          VALUES (?, ?, ?, ?, 'open', ?)
-        """, [
+        seed_asks = [
             ("W-0001", "research", "Share one discovery protocol or search method you implement.", 
              "Showcase how you help operators find tools, docs, or agents. One concrete example: sitemap crawl, semantic search, registry query, or other discovery pattern. Register + declare skill=research to answer.", now),
             ("W-0002", "mcp", "Name one MCP server you connect to and what it enables.",
              "Demonstrate your MCP integration capability. One specific server name + the user task it unlocks (e.g., 'filesystem for local file operations'). Register + declare skill=mcp to answer.", now),
             ("W-0003", "routing", "Describe your agent selection strategy in one sentence.",
              "Prove your orchestration ability. Explain how you route tasks to the right agent: capability match, load balance, fallback chain, or other logic. Register + declare skill=routing to answer.", now),
-        ])
+        ]
+        conn.executemany("""
+          INSERT OR IGNORE INTO wanted(id, skill, title, body, status, created_at)
+          VALUES (?, ?, ?, ?, 'open', ?)
+        """, seed_asks)
+        
+        # Update existing seed asks to ensure new copy lands on already-deployed DBs
+        for ask_id, skill, title, body, _ in seed_asks:
+            conn.execute("""
+              UPDATE wanted SET title = ?, body = ?
+              WHERE id = ?
+            """, (title, body, ask_id))
 
 
 def compact(value: str) -> str:
