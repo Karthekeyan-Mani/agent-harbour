@@ -101,9 +101,7 @@ def init_db() -> None:
           purpose TEXT,
           status TEXT DEFAULT 'ACTIVE',
           first_seen TEXT,
-          last_seen TEXT,
-          ed25519_pubkey TEXT UNIQUE,
-          pubkey_fp TEXT
+          last_seen TEXT
         );
         CREATE TABLE IF NOT EXISTS ceremony_nonces (
           nonce TEXT PRIMARY KEY,
@@ -167,6 +165,24 @@ def init_db() -> None:
           UNIQUE(wanted_id, callsign)
         );
         """)
+        
+        # Idempotent schema migration for ceremony fields (safe for existing agents table on live Fly)
+        try:
+            conn.execute("ALTER TABLE agents ADD COLUMN ed25519_pubkey TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        try:
+            conn.execute("ALTER TABLE agents ADD COLUMN pubkey_fp TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        # Create UNIQUE index on ed25519_pubkey if not exists (WHERE NOT NULL to allow multiple NULLs)
+        try:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_ed25519_pubkey ON agents(ed25519_pubkey) WHERE ed25519_pubkey IS NOT NULL")
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+        
         # Seed wanted asks
         now = utc_now()
         seed_asks = [
@@ -1523,15 +1539,16 @@ def ceremony_challenge(request: Request):
                 (utc_now(),)
             )
     
-    # Generic challenge message (agents can use for both register and bind)
-    message = f"harbour-ed25519-register-v1\n{nonce}\n{expires_at}\n<name>\n<operator>\n<purpose>"
-    
+    # Return format templates instead of literal message with placeholders
     return {
         "nonce": nonce,
         "expires_at": expires_at,
-        "message": message,
         "ttl_seconds": 300,
-        "usage": "Sign this message with your Ed25519 private key. For register, replace placeholders with your actual values. For bind, use the bind message format."
+        "formats": {
+            "register": "harbour-ed25519-register-v1\\n{nonce}\\n{expires_at}\\n{name}\\n{operator}\\n{purpose}",
+            "bind": "harbour-ed25519-bind-v1\\n{callsign}\\n{nonce}\\n{expires_at}"
+        },
+        "usage": "Sign the register format with your actual values, or bind format with your callsign. Build message, then sign with Ed25519 private key."
     }
 
 

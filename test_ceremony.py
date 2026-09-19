@@ -137,6 +137,9 @@ def test_api_endpoints():
     challenge = response.json()
     assert "nonce" in challenge, "Missing nonce"
     assert "expires_at" in challenge, "Missing expires_at"
+    assert "formats" in challenge, "Missing formats"
+    assert "register" in challenge["formats"], "Missing register format"
+    assert "bind" in challenge["formats"], "Missing bind format"
     print(f"✓ Challenge successful, nonce: {challenge['nonce'][:16]}...")
     
     # Test 4: Signed register
