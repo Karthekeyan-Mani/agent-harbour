@@ -1360,7 +1360,14 @@ OpenAPI: {base}/openapi-agent.json
 
 @app.post("/api/register", status_code=201)
 def register(payload: Registration, request: Request):
-    check_rate(request, limit=3, window=3600)
+    # Self-fleet verify traffic (X-Harbour-Self header) gets higher limit (30/hour)
+    # Public/anonymous register stays at 3/hour
+    # Matches self-fleet attribution used in identify_crawler() above
+    self_header = request.headers.get("X-Harbour-Self")
+    if self_header:
+        check_rate(request, limit=30, window=3600)
+    else:
+        check_rate(request, limit=3, window=3600)
     now = utc_now()
     reason = unsafe_payload(payload)
     if reason:
