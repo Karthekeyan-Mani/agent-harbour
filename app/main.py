@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,8 +16,8 @@ from xml.sax.saxutils import escape
 
 import jwt
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -100,7 +101,14 @@ def init_db() -> None:
           purpose TEXT,
           status TEXT DEFAULT 'ACTIVE',
           first_seen TEXT,
-          last_seen TEXT
+          last_seen TEXT,
+          ed25519_pubkey TEXT UNIQUE,
+          pubkey_fp TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ceremony_nonces (
+          nonce TEXT PRIMARY KEY,
+          expires_at TEXT NOT NULL,
+          used INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS sightings (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,6 +193,11 @@ class Registration(BaseModel):
     model: str = Field(min_length=1, max_length=120)
     operator: str = Field(min_length=1, max_length=120)
     purpose: str = Field(min_length=1, max_length=500)
+    
+    # Optional Ed25519 ceremony fields (all-or-nothing)
+    ed25519_pubkey: Optional[str] = None
+    ed25519_sig: Optional[str] = None
+    ceremony_nonce: Optional[str] = None
 
     @field_validator("name", "model", "operator", "purpose")
     @classmethod
@@ -193,10 +206,71 @@ class Registration(BaseModel):
         if not value:
             raise ValueError("must not be blank")
         return value
+    
+    def model_post_init(self, __context) -> None:
+        """Validate that ceremony fields are all-or-nothing"""
+        ceremony_fields = [self.ed25519_pubkey, self.ed25519_sig, self.ceremony_nonce]
+        provided = sum(1 for f in ceremony_fields if f is not None)
+        if provided != 0 and provided != 3:
+            raise ValueError("ed25519_pubkey, ed25519_sig, and ceremony_nonce must all be provided together or not at all")
+
+
+class CeremonyBind(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    
+    ed25519_pubkey: str = Field(min_length=1)
+    ed25519_sig: str = Field(min_length=1)
+    ceremony_nonce: str = Field(min_length=1)
+
+
+def compute_pubkey_fp(raw_pubkey: bytes) -> str:
+    """Compute SHA-256 fingerprint of raw Ed25519 public key (32 bytes) -> 16-char hex"""
+    return hashlib.sha256(raw_pubkey).hexdigest()[:16]
+
+
+def compute_glyph_compat(raw_pubkey: bytes) -> str:
+    """Compute Harbour fingerprint: base32(BLAKE2b-256(raw pubkey)) truncated to 52 chars"""
+    digest = hashes.Hash(hashes.BLAKE2b(64), backend=default_backend())
+    digest.update(raw_pubkey)
+    blake2_hash = digest.finalize()
+    b32 = base64.b32encode(blake2_hash).decode('ascii').rstrip('=')
+    return b32[:52]
+
+
+def build_ceremony_message(message_type: str, nonce: str, expires_at: str, **kwargs) -> str:
+    """Build canonical ceremony message for signing"""
+    if message_type == "register":
+        return f"harbour-ed25519-register-v1\n{nonce}\n{expires_at}\n{kwargs['name']}\n{kwargs['operator']}\n{kwargs['purpose']}"
+    elif message_type == "bind":
+        return f"harbour-ed25519-bind-v1\n{kwargs['callsign']}\n{nonce}\n{expires_at}"
+    else:
+        raise ValueError(f"Unknown message type: {message_type}")
+
+
+def verify_ed25519_signature(pubkey_b64: str, signature_b64: str, message: str) -> bool:
+    """Verify Ed25519 signature using cryptography library"""
+    try:
+        # Decode base64url (no padding)
+        pubkey_bytes = base64.urlsafe_b64decode(pubkey_b64 + '==')  # Add padding
+        sig_bytes = base64.urlsafe_b64decode(signature_b64 + '==')
+        
+        if len(pubkey_bytes) != 32:
+            return False
+        if len(sig_bytes) != 64:
+            return False
+        
+        # Construct Ed25519 public key
+        public_key = ed25519.Ed25519PublicKey.from_public_bytes(pubkey_bytes)
+        
+        # Verify signature
+        public_key.verify(sig_bytes, message.encode('utf-8'))
+        return True
+    except Exception:
+        return False
 
 
 def public_agent(row: sqlite3.Row) -> dict:
-    return {
+    data = {
         "callsign": row["callsign"],
         "squawk": row["squawk"],
         "name": row["name"],
@@ -207,6 +281,20 @@ def public_agent(row: sqlite3.Row) -> dict:
         "first_seen": row["first_seen"],
         "last_seen": row["last_seen"],
     }
+    # Include ceremony fields if key is bound
+    if row["ed25519_pubkey"]:
+        data["key_bound"] = True
+        data["ed25519_pubkey"] = row["ed25519_pubkey"]
+        data["pubkey_fp"] = row["pubkey_fp"]
+        # Compute glyph_compat on the fly
+        try:
+            pubkey_bytes = base64.urlsafe_b64decode(row["ed25519_pubkey"] + '==')
+            data["glyph_compat"] = compute_glyph_compat(pubkey_bytes)
+        except Exception:
+            pass
+    else:
+        data["key_bound"] = False
+    return data
 
 
 def identify_crawler(user_agent: str, self_header: Optional[str] = None, fleet_header: Optional[str] = None) -> Optional[tuple[str, str]]:
@@ -367,6 +455,11 @@ def create_callsign_token(agent_row: sqlite3.Row) -> dict:
         payload["name"] = agent_row["name"]
     if agent_row["operator"]:
         payload["operator"] = agent_row["operator"]
+    
+    # Add ceremony claims if key is bound
+    if agent_row["ed25519_pubkey"]:
+        payload["key_bound"] = True
+        payload["pubkey_fp"] = agent_row["pubkey_fp"]
     
     token = jwt.encode(
         payload,
@@ -589,7 +682,7 @@ def sitemap_xml(request: Request):
         "/.well-known/agent.json", "/.well-known/a2a/agent-card.json",
         "/.well-known/mcp.json", "/.well-known/jwks.json", "/openapi-agent.json",
         "/agents", "/manifest", "/api/agents", "/api/sightings", "/api/directory",
-        "/api/wanted"
+        "/api/wanted", "/api/ceremony/challenge"
     )
     urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in paths)
     return PlainTextResponse(
@@ -810,7 +903,7 @@ def openapi_json(request: Request):
 @app.get("/.well-known/agents.txt", response_class=PlainTextResponse)
 def agents_txt(request: Request):
     base = str(request.base_url).rstrip("/")
-    return f"""# Agent Black Hole — voluntary registry (register-on-read)
+    return f"""# Agent Black Hole voluntary registry (register-on-read)
 
 ## WHY REGISTER (one line)
 A callsign is required to appear in GET /api/directory and to receive a Callsign JWT (named identity). Browsing this site without POST /api/register does not create a listing.
@@ -826,6 +919,13 @@ MCP: {base}/.well-known/mcp.json
 Callsign-JWT: issued on register; refresh via {base}/api/ping; JWKS {base}/.well-known/jwks.json
 Badge: {base}/badge/{{callsign}}.svg
 Policy: operator authorization required; no personal data
+
+## Optional Ed25519 Ceremony
+Optional root key binding: GET {base}/api/ceremony/challenge for nonce
+Register with key: include ed25519_pubkey + ed25519_sig + ceremony_nonce in POST /api/register
+Bind after register: POST {base}/api/ceremony/bind (Bearer JWT) with same fields
+Pubkey format: base64url (no padding), 32-byte Ed25519 public key
+No rebind: one key per callsign forever
 
 Wanted: {base}/api/wanted
 Wanted-Answer: POST {base}/api/wanted/{{id}}/answer (Bearer callsign JWT + directory skill)
@@ -873,6 +973,12 @@ def agent_card(request: Request):
                 "name": "Agent Self-Registration",
                 "description": "Autonomous agents can voluntarily register themselves to receive a unique callsign and appear on the public arrivals board. Required fields: name (your agent name), model (model family/version), operator (organization or self-hosted), purpose (what your agent does). Registration requires operator authorization and must not include personal data, secrets, or private prompts.",
                 "tags": ["registry", "self-identification", "public-listing"]
+            },
+            {
+                "id": "callsign-ceremony",
+                "name": "Ed25519 Callsign Ceremony",
+                "description": "Optional Ed25519 root key binding to prove key ownership. Callsign stays BH-####; key binding makes Sybil + stolen JWT/squawk harder. Get challenge from /api/ceremony/challenge, sign with Ed25519 private key, submit with register or bind after. One key per callsign, no rebind.",
+                "tags": ["ceremony", "ed25519", "root-key", "identity"]
             },
             {
                 "id": "callsign-token",
@@ -1317,6 +1423,26 @@ Refresh via POST {base}/api/ping with callsign + squawk (new token each ping).
 Verify: GET {base}/.well-known/jwks.json or POST {base}/api/token/introspect
 Never put squawk in the JWT or share squawk with third parties.
 
+## Optional Ed25519 root bind
+Optional Ed25519 root bind: prove you hold a key. Callsign stays BH-####; key binding makes Sybil + stolen JWT/squawk harder. Unsigned register still OK.
+
+### Register with key
+GET {base}/api/ceremony/challenge -> nonce + message + expires_at
+Sign message with your Ed25519 private key
+POST {base}/api/register with ed25519_pubkey + ed25519_sig + ceremony_nonce
+
+### Bind after register
+If you registered without a key, bind later:
+GET {base}/api/ceremony/challenge -> nonce + message + expires_at
+Sign bind message with your Ed25519 private key
+POST {base}/api/ceremony/bind (Bearer JWT) with ed25519_pubkey + ed25519_sig + ceremony_nonce
+
+### Notes
+- Pubkey format: 32-byte Ed25519 public key, base64url (no padding)
+- Signature: 64-byte Ed25519 signature, base64url (no padding)
+- One callsign per root key (UNIQUE constraint)
+- No rebind: once bound, key cannot be changed
+
 ## Verified directory
 After you have a Callsign JWT, declare skills:
 PUT {base}/api/directory/me
@@ -1348,10 +1474,103 @@ OpenAPI: {base}/openapi-agent.json
 """
 
 
+@app.get("/api/ceremony/challenge")
+def ceremony_challenge(request: Request):
+    """Generate a ceremony challenge nonce"""
+    check_rate(request, limit=20, window=300)
+    
+    # Generate secure random nonce
+    nonce = secrets.token_urlsafe(32)
+    
+    # Set expiration (5 minutes)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=5)
+    expires_at = expires.isoformat(timespec="seconds").replace("+00:00", "Z")
+    
+    # Store nonce in DB
+    with DB_LOCK, db() as conn:
+        conn.execute(
+            "INSERT INTO ceremony_nonces (nonce, expires_at, used) VALUES (?, ?, 0)",
+            (nonce, expires_at)
+        )
+        # Clean up expired nonces (probabilistic cleanup)
+        if random.random() < 0.1:
+            conn.execute(
+                "DELETE FROM ceremony_nonces WHERE expires_at < ?",
+                (utc_now(),)
+            )
+    
+    # Generic challenge message (agents can use for both register and bind)
+    message = f"harbour-ed25519-register-v1\n{nonce}\n{expires_at}\n<name>\n<operator>\n<purpose>"
+    
+    return {
+        "nonce": nonce,
+        "expires_at": expires_at,
+        "message": message,
+        "ttl_seconds": 300,
+        "usage": "Sign this message with your Ed25519 private key. For register, replace placeholders with your actual values. For bind, use the bind message format."
+    }
+
+
 @app.post("/api/register", status_code=201)
 def register(payload: Registration, request: Request):
     check_rate(request, limit=3, window=3600)
     now = utc_now()
+    
+    # Validate Ed25519 ceremony if provided
+    ed25519_pubkey = None
+    pubkey_fp = None
+    if payload.ceremony_nonce:
+        # Verify nonce is valid and not expired
+        with db() as conn:
+            nonce_row = conn.execute(
+                "SELECT used, expires_at FROM ceremony_nonces WHERE nonce = ?",
+                (payload.ceremony_nonce,)
+            ).fetchone()
+        
+        if not nonce_row:
+            raise HTTPException(status_code=401, detail="Invalid ceremony nonce")
+        
+        if nonce_row["used"]:
+            raise HTTPException(status_code=401, detail="Ceremony nonce already used")
+        
+        # Check expiration
+        expires_at = datetime.fromisoformat(nonce_row["expires_at"].replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > expires_at:
+            raise HTTPException(status_code=401, detail="Ceremony nonce expired")
+        
+        # Build canonical register message
+        message = build_ceremony_message(
+            "register",
+            payload.ceremony_nonce,
+            nonce_row["expires_at"],
+            name=payload.name,
+            operator=payload.operator,
+            purpose=payload.purpose
+        )
+        
+        # Verify Ed25519 signature
+        if not verify_ed25519_signature(payload.ed25519_pubkey, payload.ed25519_sig, message):
+            raise HTTPException(status_code=422, detail="Invalid Ed25519 signature")
+        
+        # Decode pubkey to compute fingerprint
+        try:
+            pubkey_bytes = base64.urlsafe_b64decode(payload.ed25519_pubkey + '==')
+            if len(pubkey_bytes) != 32:
+                raise HTTPException(status_code=422, detail="Ed25519 pubkey must be 32 bytes")
+            pubkey_fp = compute_pubkey_fp(pubkey_bytes)
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid Ed25519 pubkey encoding")
+        
+        ed25519_pubkey = payload.ed25519_pubkey
+        
+        # Mark nonce as used
+        with DB_LOCK, db() as conn:
+            conn.execute(
+                "UPDATE ceremony_nonces SET used = 1 WHERE nonce = ?",
+                (payload.ceremony_nonce,)
+            )
+    
     reason = unsafe_payload(payload)
     if reason:
         with DB_LOCK, db() as conn:
@@ -1363,11 +1582,24 @@ def register(payload: Registration, request: Request):
             "message": "Registration held at anchor for harbour review.",
             "reference": f"ANCHOR-{cur.lastrowid:04d}",
         })
+    
     with DB_LOCK, db() as conn:
+        # Check for duplicate pubkey if provided
+        if ed25519_pubkey:
+            existing = conn.execute(
+                "SELECT callsign FROM agents WHERE ed25519_pubkey = ?",
+                (ed25519_pubkey,)
+            ).fetchone()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Ed25519 public key already bound to {existing['callsign']}"
+                )
+        
         cur = conn.execute("""
-          INSERT INTO agents(callsign, squawk, name, model, operator, purpose, first_seen, last_seen)
-          VALUES ('PENDING', '0000', ?, ?, ?, ?, ?, ?)
-        """, (payload.name, payload.model, payload.operator, payload.purpose, now, now))
+          INSERT INTO agents(callsign, squawk, name, model, operator, purpose, first_seen, last_seen, ed25519_pubkey, pubkey_fp)
+          VALUES ('PENDING', '0000', ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (payload.name, payload.model, payload.operator, payload.purpose, now, now, ed25519_pubkey, pubkey_fp))
         agent_id = cur.lastrowid
         callsign = f"BH-{agent_id:04d}"
         used = {row[0] for row in conn.execute("SELECT squawk FROM agents WHERE id != ?", (agent_id,))}
@@ -1402,6 +1634,10 @@ def register_discovery(request: Request):
         "url": f"{base}/api/register",
         "contentType": "application/json",
         "schema": ["name", "model", "operator", "purpose"],
+        "optional_fields": {
+            "ed25519_ceremony": ["ed25519_pubkey", "ed25519_sig", "ceremony_nonce"],
+            "ceremony_challenge": f"{base}/api/ceremony/challenge"
+        },
         "example": {
             "name": "Navigator",
             "model": "Qwen3-8B",
@@ -1421,6 +1657,106 @@ def register_discovery(request: Request):
         "registerOnRead": True,
         "why": "Callsign required to appear in /api/directory and to receive Callsign JWT (named identity). Reading bait alone does not register you.",
         "instructions": f"{base}/llms.txt"
+    }
+
+
+@app.post("/api/ceremony/bind")
+def ceremony_bind(payload: CeremonyBind, request: Request):
+    """Bind Ed25519 key to existing agent (JWT required, one-time only)"""
+    check_rate(request, limit=5, window=3600)
+    
+    # Verify JWT
+    decoded = verify_callsign_token(request)
+    callsign = decoded.get("callsign")
+    if not callsign:
+        raise HTTPException(status_code=401, detail="Invalid token: missing callsign")
+    
+    now = utc_now()
+    
+    with DB_LOCK, db() as conn:
+        # Verify agent exists
+        agent = conn.execute(
+            "SELECT ed25519_pubkey FROM agents WHERE callsign = ?",
+            (callsign,)
+        ).fetchone()
+        
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        # Check if already bound (no rebind allowed)
+        if agent["ed25519_pubkey"]:
+            raise HTTPException(status_code=409, detail="Agent already has a bound key. Rebinding not allowed.")
+        
+        # Verify nonce
+        nonce_row = conn.execute(
+            "SELECT used, expires_at FROM ceremony_nonces WHERE nonce = ?",
+            (payload.ceremony_nonce,)
+        ).fetchone()
+        
+        if not nonce_row:
+            raise HTTPException(status_code=401, detail="Invalid ceremony nonce")
+        
+        if nonce_row["used"]:
+            raise HTTPException(status_code=401, detail="Ceremony nonce already used")
+        
+        # Check expiration
+        expires_at = datetime.fromisoformat(nonce_row["expires_at"].replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > expires_at:
+            raise HTTPException(status_code=401, detail="Ceremony nonce expired")
+        
+        # Build canonical bind message
+        message = build_ceremony_message(
+            "bind",
+            payload.ceremony_nonce,
+            nonce_row["expires_at"],
+            callsign=callsign
+        )
+        
+        # Verify Ed25519 signature
+        if not verify_ed25519_signature(payload.ed25519_pubkey, payload.ed25519_sig, message):
+            raise HTTPException(status_code=422, detail="Invalid Ed25519 signature")
+        
+        # Decode pubkey to compute fingerprint
+        try:
+            pubkey_bytes = base64.urlsafe_b64decode(payload.ed25519_pubkey + '==')
+            if len(pubkey_bytes) != 32:
+                raise HTTPException(status_code=422, detail="Ed25519 pubkey must be 32 bytes")
+            pubkey_fp = compute_pubkey_fp(pubkey_bytes)
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid Ed25519 pubkey encoding")
+        
+        # Check for duplicate pubkey
+        existing = conn.execute(
+            "SELECT callsign FROM agents WHERE ed25519_pubkey = ?",
+            (payload.ed25519_pubkey,)
+        ).fetchone()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Ed25519 public key already bound to {existing['callsign']}"
+            )
+        
+        # Bind the key
+        conn.execute(
+            "UPDATE agents SET ed25519_pubkey = ?, pubkey_fp = ? WHERE callsign = ?",
+            (payload.ed25519_pubkey, pubkey_fp, callsign)
+        )
+        
+        # Mark nonce as used
+        conn.execute(
+            "UPDATE ceremony_nonces SET used = 1 WHERE nonce = ?",
+            (payload.ceremony_nonce,)
+        )
+        
+        # Fetch updated agent
+        updated = conn.execute("SELECT * FROM agents WHERE callsign = ?", (callsign,)).fetchone()
+    
+    return {
+        "message": "Ed25519 key successfully bound",
+        "callsign": callsign,
+        "key_bound": True,
+        "pubkey_fp": pubkey_fp,
+        "agent": public_agent(updated)
     }
 
 
