@@ -27,6 +27,7 @@ Identifies a specific internal agent by slug. The crawler will be recorded as `S
 
 - **Example**: `X-Harbour-Self: jarvis` → Recorded as `Self-jarvis` / `GrokBotFleet`
 - **Allowed characters**: `a-zA-Z0-9_-` (max 50 chars, sanitized)
+- **Rate Limit Benefit**: POST /api/register with this header gets 30/hour limit (vs 3/hour for public)
 
 ### `X-Harbour-Fleet: <fleet-name>`
 
