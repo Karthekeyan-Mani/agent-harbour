@@ -17,7 +17,6 @@ function el(tag, cls, text) {
 function agentRow(a) {
   const row = el('div', 'board-grid agent-row');
   const call = el('div','callsign',a.callsign);
-  call.append(el('span','squawk',`SQ ${a.squawk}`));
   row.append(call, el('div','',a.name), el('div','mono',a.model),
     el('div','mono',a.operator), el('div','purpose',a.purpose),
     el('div','mono',fmt(a.last_seen)), el('div','badge',a.status));
