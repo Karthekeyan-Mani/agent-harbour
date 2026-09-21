@@ -294,9 +294,13 @@ def verify_ed25519_signature(pubkey_b64: str, signature_b64: str, message: str) 
 
 
 def public_agent(row: sqlite3.Row) -> dict:
+    """
+    Public agent serialization using explicit allowlist.
+    SECURITY: Never include squawk in public responses.
+    squawk is a shared secret for POST /api/ping JWT refresh.
+    """
     data = {
         "callsign": row["callsign"],
-        "squawk": row["squawk"],
         "name": row["name"],
         "model": row["model"],
         "operator": row["operator"],
@@ -1660,9 +1664,14 @@ def register(payload: Registration, request: Request):
     badge_url = str(request.url_for("agent_badge", callsign=callsign))
     ping_url = f"{base}/api/ping"
     token_data = create_callsign_token(row)
+    
+    # Build agent response: public fields + squawk (only for register response)
+    agent_data = public_agent(row)
+    agent_data["squawk"] = row["squawk"]
+    
     return {
         "message": "Contact acquired. Welcome to the board.", 
-        "agent": public_agent(row),
+        "agent": agent_data,
         "badge_url": badge_url,
         "ping_url": ping_url,
         **token_data,
