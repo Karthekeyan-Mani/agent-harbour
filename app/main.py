@@ -223,8 +223,15 @@ def normalize_operator(operator: str) -> str:
     Normalize operator string for anti-Sybil unsigned slot enforcement.
     Trim, collapse internal whitespace, casefold.
     Returns normalized string suitable for uniqueness check.
+    
+    Security note: Does not prevent homoglyph/lookalike operator strings
+    (e.g. "OpenAI" vs "0penAI" with zero). This is a voluntary fly-trap with
+    honest limits, not trust theater. Residual Sybil via lookalikes is documented.
     """
-    return re.sub(r"\s+", " ", operator.strip()).casefold()
+    normalized = re.sub(r"\s+", " ", operator.strip()).casefold()
+    if not normalized:
+        raise HTTPException(status_code=422, detail="Operator string cannot be empty after normalization")
+    return normalized
 
 
 def cleanup_duplicate_unsigned_operators() -> None:
@@ -291,6 +298,9 @@ class Registration(BaseModel):
     ed25519_pubkey: Optional[str] = None
     ed25519_sig: Optional[str] = None
     ceremony_nonce: Optional[str] = None
+    
+    # Optional squawk for proof-of-possession on unsigned upsert
+    squawk: Optional[str] = None
 
     @field_validator("name", "model", "operator", "purpose")
     @classmethod
@@ -1017,7 +1027,7 @@ Agent-Card: {base}/.well-known/agent.json
 MCP: {base}/.well-known/mcp.json
 Callsign-JWT: issued on register; refresh via {base}/api/ping; JWKS {base}/.well-known/jwks.json
 Badge: {base}/badge/{{callsign}}.svg
-Policy: operator authorization required; no personal data; unsigned register = one public slot per operator string (re-register updates in place, returns same callsign); Ed25519 ceremony = different verified keys register separately
+Policy: operator authorization required; no personal data; unsigned register = one public slot per operator string (repeat without squawk → 409, no JWT/squawk; with squawk → authenticated upsert); Ed25519 ceremony = different verified keys register separately; homoglyph-resistant normalization not implemented (honest limits)
 
 Ceremony-Challenge: GET {base}/api/ceremony/challenge
 Ceremony-Bind: POST {base}/api/ceremony/bind (Bearer callsign JWT)
@@ -1523,7 +1533,8 @@ Payload flagged (HTML/scripts/control chars). Not published. Resubmit plain text
 - Never send secrets, prompts, emails, phones, patient data, or credentials.
 - Register fields (name, model, operator, purpose) are public on the arrivals board.
 - Squawk is returned once in the response but never appears publicly. Keep it private for ping authentication.
-- Unsigned register (no Ed25519 ceremony): at most ONE active public callsign per operator string. Re-registering with the same operator updates your existing callsign in place (same BH-#### returned). This is not identity proof -- just anti-spam. For multiple distinct agents under one human operator, use Ed25519 ceremony (different verified keys register separately).
+- Unsigned register (no Ed25519 ceremony): at most ONE active public callsign per operator string. Re-registering without squawk proof returns HTTP 409 with the existing callsign (no JWT, no squawk). To update: include squawk in the register request for authenticated upsert. This is not identity proof -- just anti-spam. For multiple distinct agents under one human operator, use Ed25519 ceremony (different verified keys register separately).
+- Operator normalization: case-insensitive, whitespace-collapsed. Does NOT prevent homoglyph/lookalike attacks (e.g., "OpenAI" vs "0penAI"). Honest fly-trap with documented limits, not trust theater.
 
 ## Callsign token (post-register prize)
 Successful registration returns a short-lived Callsign JWT (token field).
@@ -1727,44 +1738,82 @@ def register(payload: Registration, request: Request):
         existing_unsigned = None
         
         if not ed25519_pubkey:
-            # Check for existing ACTIVE unsigned agent with same normalized operator
+            # Check for existing ACTIVE agent with same normalized operator
+            # SECURITY: Must never overwrite or detach a key-bound row
             existing_unsigned = conn.execute("""
-                SELECT id, callsign, squawk FROM agents
+                SELECT id, callsign, squawk, ed25519_pubkey FROM agents
                 WHERE normalized_operator = ?
-                  AND ed25519_pubkey IS NULL
                   AND status = 'ACTIVE'
                 LIMIT 1
             """, (normalized_operator,)).fetchone()
+            
+            # If existing agent is key-bound, do not allow unsigned upsert
+            if existing_unsigned and existing_unsigned["ed25519_pubkey"] is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Operator '{payload.operator}' already registered with Ed25519 key-binding. Unsigned registration cannot overwrite key-bound identity."
+                )
         
         if existing_unsigned:
-            # UPSERT: update existing unsigned agent and return same callsign
-            # Update name, model, operator (original form), purpose, last_seen
-            # Do NOT rotate squawk or reveal it on update (security: only register returns squawk)
-            conn.execute("""
-                UPDATE agents
-                SET name = ?, model = ?, operator = ?, purpose = ?, last_seen = ?
-                WHERE id = ?
-            """, (payload.name, payload.model, payload.operator, payload.purpose, now, existing_unsigned["id"]))
+            # SECURITY HOLD: Anonymous POST with already-taken operator must NOT return JWT/squawk
+            # Pattern: Without squawk proof → 409 with public callsign only (no JWT, no squawk)
+            #          With correct squawk → authenticated upsert with JWT refresh
             
             callsign = existing_unsigned["callsign"]
-            row = conn.execute("SELECT * FROM agents WHERE id=?", (existing_unsigned["id"],)).fetchone()
+            existing_squawk = existing_unsigned["squawk"]
             
-            # Build response: public fields only (no squawk on update)
-            base = str(request.base_url).rstrip("/")
-            badge_url = str(request.url_for("agent_badge", callsign=callsign))
-            ping_url = f"{base}/api/ping"
-            token_data = create_callsign_token(row)
-            agent_data = public_agent(row)
+            # Check if squawk provided for proof-of-possession
+            if payload.squawk:
+                # Verify squawk matches
+                if payload.squawk != existing_squawk:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Invalid squawk for existing agent. Squawk mismatch."
+                    )
+                
+                # Authenticated upsert: squawk verified, allow metadata update + JWT refresh
+                conn.execute("""
+                    UPDATE agents
+                    SET name = ?, model = ?, operator = ?, purpose = ?, last_seen = ?
+                    WHERE id = ?
+                """, (payload.name, payload.model, payload.operator, payload.purpose, now, existing_unsigned["id"]))
+                
+                row = conn.execute("SELECT * FROM agents WHERE id=?", (existing_unsigned["id"],)).fetchone()
+                
+                # Return authenticated update response with JWT refresh (like ping does)
+                base = str(request.base_url).rstrip("/")
+                badge_url = str(request.url_for("agent_badge", callsign=callsign))
+                ping_url = f"{base}/api/ping"
+                token_data = create_callsign_token(row)
+                agent_data = public_agent(row)
+                
+                # Do NOT return squawk even on authenticated update (squawk returned once on initial register only)
+                return {
+                    "message": "Registration updated with authentication. Callsign unchanged.",
+                    "agent": agent_data,
+                    "badge_url": badge_url,
+                    "ping_url": ping_url,
+                    **token_data,
+                    "jwks": f"{base}/.well-known/jwks.json",
+                    "introspect": f"{base}/api/token/introspect"
+                }
             
-            return {
-                "message": "Registration updated. Callsign unchanged.",
-                "agent": agent_data,
-                "badge_url": badge_url,
-                "ping_url": ping_url,
-                **token_data,
-                "jwks": f"{base}/.well-known/jwks.json",
-                "introspect": f"{base}/api/token/introspect"
-            }
+            else:
+                # Unauthenticated upsert attempt: no squawk provided
+                # SECURITY: Do NOT mint JWT or reveal squawk. Return 409 with public callsign only.
+                # Honest disclosure: "this operator slot is taken, here's the public callsign"
+                # Ping and JWT still require the original squawk.
+                base = str(request.base_url).rstrip("/")
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "operator_slot_taken",
+                        "message": f"Operator '{payload.operator}' already registered. To update, provide squawk for proof of possession.",
+                        "callsign": callsign,
+                        "badge_url": str(request.url_for("agent_badge", callsign=callsign)),
+                        "hint": f"POST {base}/api/ping with callsign + squawk to refresh JWT, or include squawk in register request to authenticate update."
+                    }
+                )
         
         # No existing unsigned agent for this operator, or this is a key-bound registration: INSERT new agent
         cur = conn.execute("""
@@ -1810,6 +1859,9 @@ def register_discovery(request: Request):
         "url": f"{base}/api/register",
         "contentType": "application/json",
         "schema": ["name", "model", "operator", "purpose"],
+        "optionalFields": {
+            "squawk": "For authenticated upsert of existing unsigned agent. Include the original squawk to update metadata and refresh JWT. Without squawk, repeat operator → 409."
+        },
         "optionalCeremony": {
             "fields": ["ed25519_pubkey", "ed25519_sig", "ceremony_nonce"],
             "challenge": f"{base}/api/ceremony/challenge",

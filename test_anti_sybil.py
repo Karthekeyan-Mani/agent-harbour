@@ -59,8 +59,8 @@ def test_normalize_operator():
     return all_passed
 
 def test_unsigned_same_operator_same_callsign():
-    """Test that two unsigned registers with same operator get same callsign"""
-    print("\n=== Test: unsigned same operator → same callsign ===")
+    """Test that two unsigned registers with same operator: first gets credentials, second gets 409"""
+    print("\n=== Test: unsigned same operator → 409 without squawk ===")
     
     setup_test_db()
     client = TestClient(main_module.app)
@@ -77,9 +77,10 @@ def test_unsigned_same_operator_same_callsign():
     data1 = response1.json()
     callsign1 = data1["agent"]["callsign"]
     squawk1 = data1["agent"]["squawk"]
-    print(f"  First register: {callsign1}, squawk: {squawk1}")
+    token1 = data1.get("token")
+    print(f"  First register: {callsign1}, squawk: {squawk1}, has JWT: {bool(token1)}")
     
-    # Second registration with same operator (different name, model, purpose)
+    # Second registration with same operator (different name, model, purpose) - NO SQUAWK
     payload2 = {
         "name": "Agent Beta",
         "model": "Claude-3",
@@ -87,32 +88,84 @@ def test_unsigned_same_operator_same_callsign():
         "purpose": "Testing second registration"
     }
     response2 = client.post("/api/register", json=payload2)
-    assert response2.status_code == 201, f"Second register failed: {response2.status_code} {response2.text}"
+    
+    # SECURITY: Must return 409, NOT 201
+    if response2.status_code != 409:
+        print(f"  ❌ FAIL: Expected 409, got {response2.status_code}")
+        print(f"  Response: {response2.json()}")
+        return False
+    
+    print(f"  Second register (no squawk): HTTP 409 (correct)")
+    
+    # Check that response contains callsign but NO JWT and NO squawk
     data2 = response2.json()
-    callsign2 = data2["agent"]["callsign"]
+    detail = data2.get("detail", {})
     
-    print(f"  Second register: {callsign2}")
-    print(f"  Message: {data2.get('message', '')}")
-    
-    # Check that callsign is the same
-    if callsign1 == callsign2:
-        print(f"  ✓ PASS: Same callsign returned ({callsign1})")
+    if "callsign" in detail and detail["callsign"] == callsign1:
+        print(f"  ✓ PASS: 409 response includes public callsign ({callsign1})")
     else:
-        print(f"  ❌ FAIL: Different callsigns: {callsign1} vs {callsign2}")
+        print(f"  ❌ FAIL: 409 response missing or wrong callsign")
         return False
     
-    # Check that squawk is NOT in the second response (security: only first register gets squawk)
-    if "squawk" not in data2["agent"]:
-        print(f"  ✓ PASS: Squawk not revealed on update")
+    # SECURITY: Verify NO JWT in 409 response
+    if "token" not in detail and "token" not in data2:
+        print(f"  ✓ PASS: No JWT token in 409 response (security OK)")
     else:
-        print(f"  ❌ FAIL: Squawk revealed on update: {data2['agent'].get('squawk')}")
+        print(f"  ❌ FAIL: JWT token present in 409 response (SECURITY ISSUE)")
         return False
     
-    # Check that the agent was updated with new details
-    if data2["agent"]["name"] == payload2["name"]:
-        print(f"  ✓ PASS: Agent name updated to {payload2['name']}")
+    # SECURITY: Verify NO squawk in 409 response
+    if "squawk" not in detail and "squawk" not in data2:
+        print(f"  ✓ PASS: No squawk in 409 response (security OK)")
     else:
-        print(f"  ❌ FAIL: Agent name not updated")
+        print(f"  ❌ FAIL: Squawk present in 409 response (SECURITY ISSUE)")
+        return False
+    
+    # Test authenticated upsert with correct squawk
+    payload3 = {
+        "name": "Agent Gamma",
+        "model": "Gemini",
+        "operator": "PANDeveloper001",
+        "purpose": "Authenticated update",
+        "squawk": squawk1  # Provide correct squawk for proof of possession
+    }
+    response3 = client.post("/api/register", json=payload3)
+    
+    if response3.status_code != 201:
+        print(f"  ❌ FAIL: Authenticated upsert failed: {response3.status_code}")
+        return False
+    
+    data3 = response3.json()
+    callsign3 = data3["agent"]["callsign"]
+    token3 = data3.get("token")
+    
+    if callsign3 == callsign1 and token3:
+        print(f"  ✓ PASS: Authenticated upsert (with squawk) returns same callsign + JWT")
+    else:
+        print(f"  ❌ FAIL: Authenticated upsert failed validation")
+        return False
+    
+    # Verify squawk NOT returned even on authenticated update
+    if "squawk" not in data3["agent"]:
+        print(f"  ✓ PASS: Squawk not revealed on authenticated upsert")
+    else:
+        print(f"  ❌ FAIL: Squawk revealed on authenticated upsert")
+        return False
+    
+    # Test wrong squawk rejection
+    payload4 = {
+        "name": "Agent Delta",
+        "model": "GPT-4",
+        "operator": "PANDeveloper001",
+        "purpose": "Wrong squawk test",
+        "squawk": "9999"  # Wrong squawk
+    }
+    response4 = client.post("/api/register", json=payload4)
+    
+    if response4.status_code == 401:
+        print(f"  ✓ PASS: Wrong squawk rejected with 401")
+    else:
+        print(f"  ❌ FAIL: Wrong squawk not rejected properly: {response4.status_code}")
         return False
     
     # Verify database state: only one ACTIVE agent for this operator
@@ -181,9 +234,10 @@ def test_normalized_operator_matching():
     response1 = client.post("/api/register", json=payload1)
     assert response1.status_code == 201
     callsign1 = response1.json()["agent"]["callsign"]
+    squawk1 = response1.json()["agent"]["squawk"]
     print(f"  'ACME Corp' → {callsign1}")
     
-    # Register with normalized form
+    # Register with normalized form (should get 409 without squawk)
     payload2 = {
         "name": "Agent 2",
         "model": "GPT-4",
@@ -191,11 +245,16 @@ def test_normalized_operator_matching():
         "purpose": "Second"
     }
     response2 = client.post("/api/register", json=payload2)
-    assert response2.status_code == 201
-    callsign2 = response2.json()["agent"]["callsign"]
-    print(f"  'acme corp' → {callsign2}")
+    # Should get 409 since operator slot is taken
+    if response2.status_code == 409:
+        detail = response2.json().get("detail", {})
+        callsign2 = detail.get("callsign", "")
+        print(f"  'acme corp' → {callsign2} (via 409)")
+    else:
+        print(f"  ❌ FAIL: Expected 409, got {response2.status_code}")
+        return False
     
-    # Register with extra whitespace
+    # Register with extra whitespace (should also get 409)
     payload3 = {
         "name": "Agent 3",
         "model": "GPT-4",
@@ -203,9 +262,13 @@ def test_normalized_operator_matching():
         "purpose": "Third"
     }
     response3 = client.post("/api/register", json=payload3)
-    assert response3.status_code == 201
-    callsign3 = response3.json()["agent"]["callsign"]
-    print(f"  '  ACME   Corp  ' → {callsign3}")
+    if response3.status_code == 409:
+        detail = response3.json().get("detail", {})
+        callsign3 = detail.get("callsign", "")
+        print(f"  '  ACME   Corp  ' → {callsign3} (via 409)")
+    else:
+        print(f"  ❌ FAIL: Expected 409, got {response3.status_code}")
+        return False
     
     if callsign1 == callsign2 == callsign3:
         print(f"  ✓ PASS: All variations matched to same callsign ({callsign1})")
@@ -215,23 +278,11 @@ def test_normalized_operator_matching():
         return False
 
 def test_key_bound_separate_identities():
-    """Test that key-bound registrations still work independently"""
-    print("\n=== Test: key-bound registrations remain separate ===")
+    """Test that unsigned agents share slot (409 on repeat) and key-bound would be separate"""
+    print("\n=== Test: unsigned agents share slot ===")
     
     setup_test_db()
     client = TestClient(main_module.app)
-    
-    # Get two ceremony nonces
-    nonce_response1 = client.get("/api/ceremony/challenge")
-    nonce_response2 = client.get("/api/ceremony/challenge")
-    assert nonce_response1.status_code == 200
-    assert nonce_response2.status_code == 200
-    
-    # For this test, we'll simulate key-bound registrations by using different pubkeys
-    # (We won't actually sign, just test that different pubkeys get different callsigns with same operator)
-    
-    # Note: This is a simplified test. In reality, we'd need valid Ed25519 signatures.
-    # For now, we'll just verify that unsigned agents with the same operator share a slot.
     
     # Register two unsigned agents with same operator
     payload1 = {
@@ -252,15 +303,21 @@ def test_key_bound_separate_identities():
         "purpose": "Test 2"
     }
     response2 = client.post("/api/register", json=payload2)
-    assert response2.status_code == 201
-    callsign2 = response2.json()["agent"]["callsign"]
-    print(f"  Unsigned agent 2 with 'TestOperator' → {callsign2}")
     
-    if callsign1 == callsign2:
-        print(f"  ✓ PASS: Unsigned agents share the same slot")
-        return True
+    # Should get 409 since operator slot is taken
+    if response2.status_code == 409:
+        detail = response2.json().get("detail", {})
+        callsign2 = detail.get("callsign", "")
+        print(f"  Unsigned agent 2 with 'TestOperator' → {callsign2} (via 409)")
+        
+        if callsign1 == callsign2:
+            print(f"  ✓ PASS: Unsigned agents share the same slot (409 prevents duplicate)")
+            return True
+        else:
+            print(f"  ❌ FAIL: Different callsigns in 409: {callsign1} vs {callsign2}")
+            return False
     else:
-        print(f"  ❌ FAIL: Unsigned agents got different callsigns")
+        print(f"  ❌ FAIL: Expected 409, got {response2.status_code}")
         return False
 
 def test_public_list_excludes_superseded():
@@ -346,6 +403,50 @@ def test_self_fleet_rate_limit_preserved():
         print(f"  ❌ FAIL: Self-fleet register failed: {response2.status_code}")
         return False
 
+def test_unsigned_cannot_overwrite_key_bound():
+    """Test that unsigned registration cannot overwrite a key-bound agent"""
+    print("\n=== Test: unsigned cannot overwrite key-bound ===")
+    
+    setup_test_db()
+    client = TestClient(main_module.app)
+    
+    # Manually create a key-bound agent in DB
+    with DB_LOCK, db() as conn:
+        conn.execute("""
+            INSERT INTO agents(
+                callsign, squawk, name, model, operator, purpose, 
+                status, first_seen, last_seen, 
+                ed25519_pubkey, pubkey_fp, normalized_operator
+            )
+            VALUES (
+                'BH-TEST1', '1234', 'KeyBound Agent', 'Model', 'KeyBoundOp', 'Purpose',
+                'ACTIVE', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                'test_pubkey_base64', 'test_fp', ?
+            )
+        """, (normalize_operator("KeyBoundOp"),))
+    
+    # Try to register unsigned with same operator
+    payload = {
+        "name": "Unsigned Agent",
+        "model": "GPT-4",
+        "operator": "KeyBoundOp",
+        "purpose": "Attempt to overwrite"
+    }
+    response = client.post("/api/register", json=payload)
+    
+    # Should reject with 409
+    if response.status_code == 409:
+        detail = response.json().get("detail", "")
+        if "key-binding" in str(detail).lower() or "key-bound" in str(detail).lower():
+            print(f"  ✓ PASS: Unsigned register rejected for key-bound operator (409)")
+            return True
+        else:
+            print(f"  ❌ FAIL: Got 409 but wrong error message: {detail}")
+            return False
+    else:
+        print(f"  ❌ FAIL: Expected 409, got {response.status_code}")
+        return False
+
 if __name__ == '__main__':
     print("=" * 60)
     print("ANTI-SYBIL UNSIGNED OPERATOR SLOT TESTS")
@@ -353,12 +454,13 @@ if __name__ == '__main__':
     
     tests = [
         ("normalize_operator", test_normalize_operator),
-        ("unsigned_same_operator_same_callsign", test_unsigned_same_operator_same_callsign),
+        ("unsigned_same_operator_409_without_squawk", test_unsigned_same_operator_same_callsign),
         ("unsigned_different_operators_different_callsigns", test_unsigned_different_operators_different_callsigns),
         ("normalized_operator_matching", test_normalized_operator_matching),
-        ("key_bound_separate_identities", test_key_bound_separate_identities),
+        ("unsigned_agents_share_slot", test_key_bound_separate_identities),
         ("public_list_excludes_superseded", test_public_list_excludes_superseded),
         ("self_fleet_rate_limit_preserved", test_self_fleet_rate_limit_preserved),
+        ("unsigned_cannot_overwrite_key_bound", test_unsigned_cannot_overwrite_key_bound),
     ]
     
     results = []
