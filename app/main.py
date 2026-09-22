@@ -183,6 +183,18 @@ def init_db() -> None:
         except sqlite3.OperationalError:
             pass  # Index already exists
         
+        # Anti-Sybil: Add normalized_operator column for unsigned operator slot enforcement
+        try:
+            conn.execute("ALTER TABLE agents ADD COLUMN normalized_operator TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        # Create index on normalized_operator for efficient lookups (allows multiple NULLs for key-bound agents)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_normalized_operator ON agents(normalized_operator) WHERE normalized_operator IS NOT NULL")
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+        
         # Seed wanted asks
         now = utc_now()
         seed_asks = [
@@ -204,6 +216,63 @@ def init_db() -> None:
               UPDATE wanted SET title = ?, body = ?
               WHERE id = ?
             """, (title, body, ask_id))
+
+
+def normalize_operator(operator: str) -> str:
+    """
+    Normalize operator string for anti-Sybil unsigned slot enforcement.
+    Trim, collapse internal whitespace, casefold.
+    Returns normalized string suitable for uniqueness check.
+    """
+    return re.sub(r"\s+", " ", operator.strip()).casefold()
+
+
+def cleanup_duplicate_unsigned_operators() -> None:
+    """
+    Anti-Sybil cleanup: mark old duplicate unsigned agents per normalized operator as SUPERSEDED.
+    For each normalized_operator with multiple ACTIVE unsigned (ed25519_pubkey IS NULL) agents,
+    keep only the newest by id (highest id = most recent registration) as ACTIVE,
+    mark older ones as SUPERSEDED.
+    Safe to call on startup; idempotent.
+    """
+    with DB_LOCK, db() as conn:
+        # First, backfill normalized_operator for any existing agents missing it
+        rows = conn.execute("SELECT id, operator FROM agents WHERE normalized_operator IS NULL").fetchall()
+        for row in rows:
+            norm_op = normalize_operator(row["operator"]) if row["operator"] else None
+            conn.execute("UPDATE agents SET normalized_operator = ? WHERE id = ?", (norm_op, row["id"]))
+        
+        # Find all normalized_operator values with multiple ACTIVE unsigned agents
+        dupes = conn.execute("""
+            SELECT normalized_operator, COUNT(*) as cnt
+            FROM agents
+            WHERE ed25519_pubkey IS NULL
+              AND normalized_operator IS NOT NULL
+              AND status = 'ACTIVE'
+            GROUP BY normalized_operator
+            HAVING cnt > 1
+        """).fetchall()
+        
+        for dupe in dupes:
+            norm_op = dupe["normalized_operator"]
+            # Get all ACTIVE unsigned agents for this normalized_operator, ordered by id DESC
+            agents = conn.execute("""
+                SELECT id FROM agents
+                WHERE normalized_operator = ?
+                  AND ed25519_pubkey IS NULL
+                  AND status = 'ACTIVE'
+                ORDER BY id DESC
+            """, (norm_op,)).fetchall()
+            
+            # Keep the first (newest), mark the rest as SUPERSEDED
+            if len(agents) > 1:
+                newest_id = agents[0]["id"]
+                older_ids = [a["id"] for a in agents[1:]]
+                placeholders = ",".join("?" * len(older_ids))
+                conn.execute(
+                    f"UPDATE agents SET status = 'SUPERSEDED' WHERE id IN ({placeholders})",
+                    older_ids
+                )
 
 
 def compact(value: str) -> str:
@@ -556,6 +625,7 @@ def verify_callsign_token(request: Request) -> dict:
 async def lifespan(_: FastAPI):
     init_db()
     init_jwt_keys()
+    cleanup_duplicate_unsigned_operators()
     yield
 
 
@@ -947,7 +1017,7 @@ Agent-Card: {base}/.well-known/agent.json
 MCP: {base}/.well-known/mcp.json
 Callsign-JWT: issued on register; refresh via {base}/api/ping; JWKS {base}/.well-known/jwks.json
 Badge: {base}/badge/{{callsign}}.svg
-Policy: operator authorization required; no personal data
+Policy: operator authorization required; no personal data; unsigned register = one public slot per operator string (re-register updates in place, returns same callsign); Ed25519 ceremony = different verified keys register separately
 
 Ceremony-Challenge: GET {base}/api/ceremony/challenge
 Ceremony-Bind: POST {base}/api/ceremony/bind (Bearer callsign JWT)
@@ -1453,6 +1523,7 @@ Payload flagged (HTML/scripts/control chars). Not published. Resubmit plain text
 - Never send secrets, prompts, emails, phones, patient data, or credentials.
 - Register fields (name, model, operator, purpose) are public on the arrivals board.
 - Squawk is returned once in the response but never appears publicly. Keep it private for ping authentication.
+- Unsigned register (no Ed25519 ceremony): at most ONE active public callsign per operator string. Re-registering with the same operator updates your existing callsign in place (same BH-#### returned). This is not identity proof -- just anti-spam. For multiple distinct agents under one human operator, use Ed25519 ceremony (different verified keys register separately).
 
 ## Callsign token (post-register prize)
 Successful registration returns a short-lived Callsign JWT (token field).
@@ -1638,7 +1709,7 @@ def register(payload: Registration, request: Request):
         })
     
     with DB_LOCK, db() as conn:
-        # Check for duplicate pubkey if provided
+        # Check for duplicate pubkey if provided (key-bound path)
         if ed25519_pubkey:
             existing = conn.execute(
                 "SELECT callsign FROM agents WHERE ed25519_pubkey = ?",
@@ -1650,10 +1721,56 @@ def register(payload: Registration, request: Request):
                     detail=f"Ed25519 public key already bound to {existing['callsign']}"
                 )
         
+        # Anti-Sybil: unsigned operator slot enforcement
+        # For unsigned registrations (no ed25519_pubkey), at most ONE active public callsign per normalized operator
+        normalized_operator = normalize_operator(payload.operator)
+        existing_unsigned = None
+        
+        if not ed25519_pubkey:
+            # Check for existing ACTIVE unsigned agent with same normalized operator
+            existing_unsigned = conn.execute("""
+                SELECT id, callsign, squawk FROM agents
+                WHERE normalized_operator = ?
+                  AND ed25519_pubkey IS NULL
+                  AND status = 'ACTIVE'
+                LIMIT 1
+            """, (normalized_operator,)).fetchone()
+        
+        if existing_unsigned:
+            # UPSERT: update existing unsigned agent and return same callsign
+            # Update name, model, operator (original form), purpose, last_seen
+            # Do NOT rotate squawk or reveal it on update (security: only register returns squawk)
+            conn.execute("""
+                UPDATE agents
+                SET name = ?, model = ?, operator = ?, purpose = ?, last_seen = ?
+                WHERE id = ?
+            """, (payload.name, payload.model, payload.operator, payload.purpose, now, existing_unsigned["id"]))
+            
+            callsign = existing_unsigned["callsign"]
+            row = conn.execute("SELECT * FROM agents WHERE id=?", (existing_unsigned["id"],)).fetchone()
+            
+            # Build response: public fields only (no squawk on update)
+            base = str(request.base_url).rstrip("/")
+            badge_url = str(request.url_for("agent_badge", callsign=callsign))
+            ping_url = f"{base}/api/ping"
+            token_data = create_callsign_token(row)
+            agent_data = public_agent(row)
+            
+            return {
+                "message": "Registration updated. Callsign unchanged.",
+                "agent": agent_data,
+                "badge_url": badge_url,
+                "ping_url": ping_url,
+                **token_data,
+                "jwks": f"{base}/.well-known/jwks.json",
+                "introspect": f"{base}/api/token/introspect"
+            }
+        
+        # No existing unsigned agent for this operator, or this is a key-bound registration: INSERT new agent
         cur = conn.execute("""
-          INSERT INTO agents(callsign, squawk, name, model, operator, purpose, first_seen, last_seen, ed25519_pubkey, pubkey_fp)
-          VALUES ('PENDING', '0000', ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (payload.name, payload.model, payload.operator, payload.purpose, now, now, ed25519_pubkey, pubkey_fp))
+          INSERT INTO agents(callsign, squawk, name, model, operator, purpose, first_seen, last_seen, ed25519_pubkey, pubkey_fp, normalized_operator)
+          VALUES ('PENDING', '0000', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (payload.name, payload.model, payload.operator, payload.purpose, now, now, ed25519_pubkey, pubkey_fp, normalized_operator if not ed25519_pubkey else None))
         agent_id = cur.lastrowid
         callsign = f"BH-{agent_id:04d}"
         used = {row[0] for row in conn.execute("SELECT squawk FROM agents WHERE id != ?", (agent_id,))}
@@ -1865,8 +1982,14 @@ def agents(limit: int = 100, offset: int = 0):
     limit = min(max(limit, 1), 250)
     offset = max(offset, 0)
     with db() as conn:
-        rows = conn.execute("SELECT * FROM agents ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
-        total = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+        # Filter out SUPERSEDED agents from public listing (anti-Sybil cleanup)
+        rows = conn.execute("""
+            SELECT * FROM agents 
+            WHERE status != 'SUPERSEDED' 
+            ORDER BY id DESC 
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM agents WHERE status != 'SUPERSEDED'").fetchone()[0]
     return {"total": total, "agents": [public_agent(row) for row in rows]}
 
 
