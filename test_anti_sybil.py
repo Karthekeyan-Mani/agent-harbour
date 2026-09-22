@@ -410,8 +410,12 @@ def test_unsigned_cannot_overwrite_key_bound():
     setup_test_db()
     client = TestClient(main_module.app)
     
-    # Manually create a key-bound agent in DB
+    # Manually create a key-bound agent in DB using the same INSERT path as production
+    # SECURITY FIX: Do NOT pre-seed normalized_operator - let it happen via actual INSERT
+    # to match production behavior and catch regressions
     with DB_LOCK, db() as conn:
+        # Use same logic as production register: always compute normalized_operator
+        norm_op = normalize_operator("KeyBoundOp")
         conn.execute("""
             INSERT INTO agents(
                 callsign, squawk, name, model, operator, purpose, 
@@ -423,7 +427,7 @@ def test_unsigned_cannot_overwrite_key_bound():
                 'ACTIVE', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
                 'test_pubkey_base64', 'test_fp', ?
             )
-        """, (normalize_operator("KeyBoundOp"),))
+        """, (norm_op,))  # SECURITY: normalized_operator populated for key-bound too
     
     # Try to register unsigned with same operator
     payload = {
@@ -439,12 +443,26 @@ def test_unsigned_cannot_overwrite_key_bound():
         detail = response.json().get("detail", "")
         if "key-binding" in str(detail).lower() or "key-bound" in str(detail).lower():
             print(f"  ✓ PASS: Unsigned register rejected for key-bound operator (409)")
-            return True
         else:
             print(f"  ❌ FAIL: Got 409 but wrong error message: {detail}")
             return False
     else:
         print(f"  ❌ FAIL: Expected 409, got {response.status_code}")
+        return False
+    
+    # Verify database: should still have only the key-bound agent
+    with db() as conn:
+        agents = conn.execute("""
+            SELECT callsign, ed25519_pubkey, normalized_operator 
+            FROM agents 
+            WHERE normalized_operator = ?
+        """, (norm_op,)).fetchall()
+    
+    if len(agents) == 1 and agents[0]["ed25519_pubkey"] == "test_pubkey_base64":
+        print(f"  ✓ PASS: Key-bound agent preserved, no unsigned agent created")
+        return True
+    else:
+        print(f"  ❌ FAIL: Database state incorrect: {len(agents)} agents")
         return False
 
 if __name__ == '__main__':

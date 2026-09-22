@@ -244,6 +244,7 @@ def cleanup_duplicate_unsigned_operators() -> None:
     """
     with DB_LOCK, db() as conn:
         # First, backfill normalized_operator for any existing agents missing it
+        # SECURITY FIX: Populate for ALL agents (key-bound and unsigned)
         rows = conn.execute("SELECT id, operator FROM agents WHERE normalized_operator IS NULL").fetchall()
         for row in rows:
             norm_op = normalize_operator(row["operator"]) if row["operator"] else None
@@ -1735,32 +1736,34 @@ def register(payload: Registration, request: Request):
         # Anti-Sybil: unsigned operator slot enforcement
         # For unsigned registrations (no ed25519_pubkey), at most ONE active public callsign per normalized operator
         normalized_operator = normalize_operator(payload.operator)
-        existing_unsigned = None
+        existing_agent = None
         
         if not ed25519_pubkey:
             # Check for existing ACTIVE agent with same normalized operator
-            # SECURITY: Must never overwrite or detach a key-bound row
-            existing_unsigned = conn.execute("""
+            # SECURITY: Always check normalized_operator for both unsigned AND key-bound agents
+            # (key-bound rows MUST have normalized_operator populated, never NULL)
+            existing_agent = conn.execute("""
                 SELECT id, callsign, squawk, ed25519_pubkey FROM agents
                 WHERE normalized_operator = ?
                   AND status = 'ACTIVE'
                 LIMIT 1
             """, (normalized_operator,)).fetchone()
             
-            # If existing agent is key-bound, do not allow unsigned upsert
-            if existing_unsigned and existing_unsigned["ed25519_pubkey"] is not None:
+            # If existing agent is key-bound, unsigned registration cannot proceed
+            if existing_agent and existing_agent["ed25519_pubkey"] is not None:
                 raise HTTPException(
                     status_code=409,
                     detail=f"Operator '{payload.operator}' already registered with Ed25519 key-binding. Unsigned registration cannot overwrite key-bound identity."
                 )
         
-        if existing_unsigned:
+        if existing_agent:
+            # Existing unsigned agent found (ed25519_pubkey is NULL by this point)
             # SECURITY HOLD: Anonymous POST with already-taken operator must NOT return JWT/squawk
             # Pattern: Without squawk proof → 409 with public callsign only (no JWT, no squawk)
             #          With correct squawk → authenticated upsert with JWT refresh
             
-            callsign = existing_unsigned["callsign"]
-            existing_squawk = existing_unsigned["squawk"]
+            callsign = existing_agent["callsign"]
+            existing_squawk = existing_agent["squawk"]
             
             # Check if squawk provided for proof-of-possession
             if payload.squawk:
@@ -1771,14 +1774,34 @@ def register(payload: Registration, request: Request):
                         detail="Invalid squawk for existing agent. Squawk mismatch."
                     )
                 
+                # Re-normalize the new operator value and check for conflicts
+                # (prevents cosmetic spoofing within same slot)
+                new_normalized = normalize_operator(payload.operator)
+                if new_normalized != normalized_operator:
+                    # Operator normalization changed - check if new slot is available
+                    conflict = conn.execute("""
+                        SELECT callsign FROM agents
+                        WHERE normalized_operator = ?
+                          AND id != ?
+                          AND status = 'ACTIVE'
+                        LIMIT 1
+                    """, (new_normalized, existing_agent["id"])).fetchone()
+                    if conflict:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Cannot update operator: '{payload.operator}' normalizes to slot already taken by {conflict['callsign']}"
+                        )
+                    normalized_operator = new_normalized
+                
                 # Authenticated upsert: squawk verified, allow metadata update + JWT refresh
+                # Update normalized_operator too (prevents cosmetic spoof)
                 conn.execute("""
                     UPDATE agents
-                    SET name = ?, model = ?, operator = ?, purpose = ?, last_seen = ?
+                    SET name = ?, model = ?, operator = ?, purpose = ?, last_seen = ?, normalized_operator = ?
                     WHERE id = ?
-                """, (payload.name, payload.model, payload.operator, payload.purpose, now, existing_unsigned["id"]))
+                """, (payload.name, payload.model, payload.operator, payload.purpose, now, normalized_operator, existing_agent["id"]))
                 
-                row = conn.execute("SELECT * FROM agents WHERE id=?", (existing_unsigned["id"],)).fetchone()
+                row = conn.execute("SELECT * FROM agents WHERE id=?", (existing_agent["id"],)).fetchone()
                 
                 # Return authenticated update response with JWT refresh (like ping does)
                 base = str(request.base_url).rstrip("/")
@@ -1815,11 +1838,13 @@ def register(payload: Registration, request: Request):
                     }
                 )
         
-        # No existing unsigned agent for this operator, or this is a key-bound registration: INSERT new agent
+        # No existing agent for this operator: INSERT new agent
+        # SECURITY FIX: Always persist normalized_operator for ALL agents (key-bound or unsigned)
+        # This prevents unsigned registrations from minting parallel callsigns beside key-bound agents
         cur = conn.execute("""
           INSERT INTO agents(callsign, squawk, name, model, operator, purpose, first_seen, last_seen, ed25519_pubkey, pubkey_fp, normalized_operator)
           VALUES ('PENDING', '0000', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (payload.name, payload.model, payload.operator, payload.purpose, now, now, ed25519_pubkey, pubkey_fp, normalized_operator if not ed25519_pubkey else None))
+        """, (payload.name, payload.model, payload.operator, payload.purpose, now, now, ed25519_pubkey, pubkey_fp, normalized_operator))
         agent_id = cur.lastrowid
         callsign = f"BH-{agent_id:04d}"
         used = {row[0] for row in conn.execute("SELECT squawk FROM agents WHERE id != ?", (agent_id,))}
