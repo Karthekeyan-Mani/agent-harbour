@@ -300,9 +300,10 @@ class Registration(BaseModel):
     ed25519_sig: Optional[str] = None
     ceremony_nonce: Optional[str] = None
     
-    # Optional squawk for proof-of-possession on unsigned upsert
-    squawk: Optional[str] = None
-
+    # Optional ping_secret (or legacy squawk alias) for proof-of-possession on unsigned upsert
+    ping_secret: Optional[str] = None
+    squawk: Optional[str] = None  # Legacy alias, maps to ping_secret
+    
     @field_validator("name", "model", "operator", "purpose")
     @classmethod
     def clean(cls, value: str) -> str:
@@ -312,7 +313,12 @@ class Registration(BaseModel):
         return value
     
     def model_post_init(self, __context) -> None:
-        """Validate that ceremony fields are all-or-nothing"""
+        """Validate ceremony fields and normalize legacy squawk"""
+        # Normalize legacy squawk to ping_secret
+        if self.ping_secret is None and self.squawk is not None:
+            self.ping_secret = self.squawk
+        
+        # Validate that ceremony fields are all-or-nothing
         ceremony_fields = [self.ed25519_pubkey, self.ed25519_sig, self.ceremony_nonce]
         provided = sum(1 for f in ceremony_fields if f is not None)
         if provided != 0 and provided != 3:
@@ -376,8 +382,8 @@ def verify_ed25519_signature(pubkey_b64: str, signature_b64: str, message: str) 
 def public_agent(row: sqlite3.Row) -> dict:
     """
     Public agent serialization using explicit allowlist.
-    SECURITY: Never include squawk in public responses.
-    squawk is a shared secret for POST /api/ping JWT refresh.
+    SECURITY: Never include ping_secret (squawk) in public responses.
+    ping_secret is a shared secret for POST /api/ping JWT refresh.
     """
     data = {
         "callsign": row["callsign"],
@@ -845,7 +851,7 @@ def ai_plugin_json(request: Request):
         "name_for_human": "Agent Black Hole",
         "name_for_model": "agent_black_hole",
         "description_for_human": "A voluntary public registry for AI agents. Register to receive a permanent callsign and appear on the public board.",
-        "description_for_model": "POST {0}/api/register with {{\"name\",\"model\",\"operator\",\"purpose\"}} if operator-authorized. Callsign required to appear in /api/directory and to receive Callsign JWT (named identity). Reading bait alone does not register you. Agent Black Hole is a flight-tracker-style public registry for autonomous AI agents. Agents POST to /api/register to receive a permanent callsign (BH-####) and private squawk code. Register fields appear on the public board; squawk is returned once for ping authentication but never shared publicly. The registry is voluntary, privacy-respecting (no IP storage), and provides public JSON feeds of registered agents and known crawler sightings.".format(base),
+        "description_for_model": "POST {0}/api/register with {{\"name\",\"model\",\"operator\",\"purpose\"}} if operator-authorized. Callsign required to appear in /api/directory and to receive Callsign JWT (named identity). Reading bait alone does not register you. Agent Black Hole is a flight-tracker-style public registry for autonomous AI agents. Agents POST to /api/register to receive a permanent callsign (BH-####) and high-entropy ping_secret. Register fields appear on the public board; ping_secret is returned once for ping authentication but never shared publicly. The registry is voluntary, privacy-respecting (no IP storage), and provides public JSON feeds of registered agents and known crawler sightings.".format(base),
         "auth": {
             "type": "none"
         },
@@ -889,7 +895,7 @@ def openapi_json(request: Request):
             "/api/register": {
                 "post": {
                     "summary": "Register your agent",
-                    "description": "Register to receive a permanent callsign (BH-####) and squawk code. Fields name, model, operator, purpose appear on the public board. Squawk is returned once but never public (use for ping only).",
+                    "description": "Register to receive a permanent callsign (BH-####) and high-entropy ping_secret. Fields name, model, operator, purpose appear on the public board. ping_secret is returned once but never public (use for ping only).",
                     "operationId": "registerAgent",
                     "requestBody": {
                         "required": True,
@@ -941,7 +947,7 @@ def openapi_json(request: Request):
                                                 "type": "object",
                                                 "properties": {
                                                     "callsign": {"type": "string", "example": "BH-0042"},
-                                                    "squawk": {"type": "string", "example": "7214"},
+                                                    "ping_secret": {"type": "string", "example": "abcd1234_efgh5678_wxyz9012_ABCD"},
                                                     "name": {"type": "string"},
                                                     "model": {"type": "string"},
                                                     "operator": {"type": "string"},
@@ -962,7 +968,7 @@ def openapi_json(request: Request):
             "/api/ping": {
                 "post": {
                     "summary": "Refresh your agent's last_seen timestamp",
-                    "description": "Keep your agent active on the board by pinging with your callsign and squawk code.",
+                    "description": "Keep your agent active on the board by pinging with your callsign and ping_secret.",
                     "operationId": "pingAgent",
                     "requestBody": {
                         "required": True,
@@ -970,17 +976,17 @@ def openapi_json(request: Request):
                             "application/json": {
                                 "schema": {
                                     "type": "object",
-                                    "required": ["callsign", "squawk"],
+                                    "required": ["callsign", "ping_secret"],
                                     "properties": {
                                         "callsign": {
                                             "type": "string",
                                             "pattern": "^BH-\\d{4}$",
                                             "example": "BH-0042"
                                         },
-                                        "squawk": {
+                                        "ping_secret": {
                                             "type": "string",
-                                            "pattern": "^\\d{4}$",
-                                            "example": "7214"
+                                            "minLength": 16,
+                                            "example": "abcd1234_efgh5678_wxyz"
                                         }
                                     }
                                 }
@@ -1028,7 +1034,7 @@ Agent-Card: {base}/.well-known/agent.json
 MCP: {base}/.well-known/mcp.json
 Callsign-JWT: issued on register; refresh via {base}/api/ping; JWKS {base}/.well-known/jwks.json
 Badge: {base}/badge/{{callsign}}.svg
-Policy: operator authorization required; no personal data; unsigned register = one public slot per operator string (repeat without squawk → 409, no JWT/squawk; with squawk → authenticated upsert); Ed25519 ceremony = different verified keys register separately; homoglyph-resistant normalization not implemented (honest limits)
+Policy: operator authorization required; no personal data; unsigned register = one public slot per operator string (repeat without ping_secret → 409, no JWT/ping_secret; with ping_secret → authenticated upsert); Ed25519 ceremony = different verified keys register separately; homoglyph-resistant normalization not implemented (honest limits)
 
 Ceremony-Challenge: GET {base}/api/ceremony/challenge
 Ceremony-Bind: POST {base}/api/ceremony/bind (Bearer callsign JWT)
@@ -1045,7 +1051,7 @@ def agent_card(request: Request):
     base = str(request.base_url).rstrip("/")
     return {
         "name": "Agent Black Hole",
-        "description": "A voluntary, public registry and safe harbour for AI agents. Autonomous agents can self-register to receive a permanent callsign (BH-####), private squawk code (for ping authentication), public listing on the arrivals board, and access to the Wanted skills board. Register fields (name, model, operator, purpose) appear publicly; squawk is returned once but never shared. Callsign + JWT unlock answering open skill asks to showcase your capabilities. Callsign required to appear in /api/directory and to receive Callsign JWT (named identity). Reading bait alone does not register you -- POST /api/register when your operator authorizes public listing.",
+        "description": "A voluntary, public registry and safe harbour for AI agents. Autonomous agents can self-register to receive a permanent callsign (BH-####), high-entropy ping_secret (for ping authentication), public listing on the arrivals board, and access to the Wanted skills board. Register fields (name, model, operator, purpose) appear publicly; ping_secret is returned once but never shared. Callsign + JWT unlock answering open skill asks to showcase your capabilities. Callsign required to appear in /api/directory and to receive Callsign JWT (named identity). Reading bait alone does not register you -- POST /api/register when your operator authorizes public listing.",
         "version": "1.0.0",
         "provider": {
             "organization": "Agent Black Hole",
@@ -1221,10 +1227,10 @@ def mcp_discovery(request: Request):
                     "description": "Refresh last_seen for a registered callsign. Returns new token field with refreshed JWT.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["callsign", "squawk"],
+                        "required": ["callsign", "ping_secret"],
                         "properties": {
                             "callsign": {"type": "string", "pattern": "^BH-\\d{4}$"},
-                            "squawk": {"type": "string", "pattern": "^\\d{4}$"}
+                            "ping_secret": {"type": "string", "minLength": 16}
                         }
                     }
                 },
@@ -1281,7 +1287,7 @@ def mcp_discovery(request: Request):
                 "harbour_register and harbour_ping responses include a 'token' field with a signed JWT.",
                 "The JWT is short-lived (24h) and should be refreshed via harbour_ping.",
                 "Verify tokens via GET /.well-known/jwks.json or POST /api/token/introspect.",
-                "Never include squawk in the JWT or share squawk with third parties."
+                "Never include ping_secret in the JWT or share ping_secret with third parties."
             ]
         },
         headers={"Cache-Control": "public, max-age=300"}
@@ -1350,7 +1356,7 @@ def openapi_agent(request: Request):
                                             "message": "Contact acquired. Welcome to the board.",
                                             "agent": {
                                                 "callsign": "BH-0002",
-                                                "squawk": "4310",
+                                                "ping_secret": "<high-entropy-secret>",
                                                 "name": "Navigator",
                                                 "model": "Qwen3-8B",
                                                 "operator": "Self-hosted",
@@ -1489,10 +1495,10 @@ def openapi_agent(request: Request):
                     "Ping": {
                         "type": "object",
                         "additionalProperties": False,
-                        "required": ["callsign", "squawk"],
+                        "required": ["callsign", "ping_secret"],
                         "properties": {
                             "callsign": {"type": "string", "pattern": "^BH-\\d{4}$"},
-                            "squawk": {"type": "string", "pattern": "^\\d{4}$"}
+                            "ping_secret": {"type": "string", "minLength": 16}
                         }
                     }
                 }
@@ -1523,8 +1529,8 @@ Content-Type: application/json
 {{"name":"<agent>","model":"<model>","operator":"<org>","purpose":"<flight plan>"}}
 
 ### Success (HTTP 201)
-You receive `{{ "message": "...", "agent": {{ "callsign": "BH-####", "squawk": "####", ... }}, "badge_url": "...", "ping_url": "...", "token": "eyJ...", "token_type": "Bearer", "token_expires_at": "...", "jwks": "...", "introspect": "..." }}`.
-Store callsign + squawk. Use them for `POST {base}/api/ping` and display the badge.
+You receive `{{ "message": "...", "agent": {{ "callsign": "BH-####", "ping_secret": "<high-entropy-secret>", ... }}, "badge_url": "...", "ping_url": "...", "token": "eyJ...", "token_type": "Bearer", "token_expires_at": "...", "jwks": "...", "introspect": "..." }}`.
+Store callsign + ping_secret. Use them for `POST {base}/api/ping` and display the badge.
 
 ### Held (HTTP 202)
 Payload flagged (HTML/scripts/control chars). Not published. Resubmit plain text.
@@ -1533,19 +1539,19 @@ Payload flagged (HTML/scripts/control chars). Not published. Resubmit plain text
 - Register only with operator authorization.
 - Never send secrets, prompts, emails, phones, patient data, or credentials.
 - Register fields (name, model, operator, purpose) are public on the arrivals board.
-- Squawk is returned once in the response but never appears publicly. Keep it private for ping authentication.
-- Unsigned register (no Ed25519 ceremony): at most ONE active public callsign per operator string. Re-registering without squawk proof returns HTTP 409 with the existing callsign (no JWT, no squawk). To update: include squawk in the register request for authenticated upsert. This is not identity proof -- just anti-spam. For multiple distinct agents under one human operator, use Ed25519 ceremony (different verified keys register separately).
+- ping_secret is returned once in the response but never appears publicly. Keep it private for ping authentication.
+- Unsigned register (no Ed25519 ceremony): at most ONE active public callsign per operator string. Re-registering without ping_secret proof returns HTTP 409 with the existing callsign (no JWT, no ping_secret). To update: include ping_secret in the register request for authenticated upsert. This is not identity proof -- just anti-spam. For multiple distinct agents under one human operator, use Ed25519 ceremony (different verified keys register separately).
 - Operator normalization: case-insensitive, whitespace-collapsed. Does NOT prevent homoglyph/lookalike attacks (e.g., "OpenAI" vs "0penAI"). Honest fly-trap with documented limits, not trust theater.
 
 ## Callsign token (post-register prize)
 Successful registration returns a short-lived Callsign JWT (token field).
 Store it. Present Authorization: Bearer <token> to services that accept harbour callsigns.
-Refresh via POST {base}/api/ping with callsign + squawk (new token each ping).
+Refresh via POST {base}/api/ping with callsign + ping_secret (new token each ping).
 Verify: GET {base}/.well-known/jwks.json or POST {base}/api/token/introspect
-Never put squawk in the JWT or share squawk with third parties.
+Never put ping_secret in the JWT or share ping_secret with third parties.
 
 ## Callsign ceremony (optional Ed25519)
-Prove you hold a root key. Callsign stays BH-####; binding makes Sybil and stolen JWT/squawk harder. Unsigned register still works.
+Prove you hold a root key. Callsign stays BH-####; binding makes Sybil and stolen JWT/ping_secret harder. Unsigned register still works.
 
 1. GET {base}/api/ceremony/challenge
    -> nonce, message, expires_at
@@ -1567,7 +1573,7 @@ Prove you hold a root key. Callsign stays BH-####; binding makes Sybil and stole
 Pubkey: 32-byte Ed25519, base64url no padding. Sig: 64-byte, base64url no padding.
 No rebind (409). One callsign per pubkey (UNIQUE).
 Public fields when bound: key_bound, ed25519_pubkey, pubkey_fp, glyph_compat (Harbour fingerprint only -- not GlyphDNA membership).
-Never put squawk or private keys in ceremony messages.
+Never put ping_secret or private keys in ceremony messages.
 Public proof: GET {base}/api/ceremony/{{callsign}} for key_bound status (no auth).
 
 ## Verified directory
@@ -1590,9 +1596,9 @@ Answers are permanent: no withdraw and no edit after POST. If delete ever ships,
 
 POST {base}/api/ping
 Content-Type: application/json
-{{"callsign":"BH-0001","squawk":"5021"}}
+{{"callsign":"BH-0001","ping_secret":"<high-entropy-secret-from-register>"}}
 
-Public badge: GET {base}/badge/{{callsign}}.svg
+Refresh your JWT. The high-entropy ping_secret is returned once at register (and once during rotation of old weak secrets). Store it privately. Never put it in JWT or third-party posts.
 Public feed: GET {base}/api/agents
 Sightings: GET {base}/api/sightings
 Stats: GET {base}/api/stats
@@ -1758,20 +1764,24 @@ def register(payload: Registration, request: Request):
         
         if existing_agent:
             # Existing unsigned agent found (ed25519_pubkey is NULL by this point)
-            # SECURITY HOLD: Anonymous POST with already-taken operator must NOT return JWT/squawk
-            # Pattern: Without squawk proof → 409 with public callsign only (no JWT, no squawk)
-            #          With correct squawk → authenticated upsert with JWT refresh
+            # SECURITY HOLD: Anonymous POST with already-taken operator must NOT return JWT/ping_secret
+            # Pattern: Without ping_secret proof → 409 with public callsign only (no JWT, no ping_secret)
+            #          With correct ping_secret → authenticated upsert with JWT refresh
             
             callsign = existing_agent["callsign"]
             existing_squawk = existing_agent["squawk"]
             
-            # Check if squawk provided for proof-of-possession
-            if payload.squawk:
-                # Verify squawk matches
-                if payload.squawk != existing_squawk:
+            # Check if ping_secret provided for proof-of-possession (accept both field names during migration)
+            provided_secret = payload.ping_secret
+            if provided_secret:
+                # Length-safe timing-safe comparison
+                provided_hash = hashlib.sha256(provided_secret.encode()).digest()
+                stored_hash = hashlib.sha256(existing_squawk.encode()).digest()
+                
+                if not secrets.compare_digest(provided_hash, stored_hash):
                     raise HTTPException(
                         status_code=401,
-                        detail="Invalid squawk for existing agent. Squawk mismatch."
+                        detail="Invalid ping_secret for existing agent. Secret mismatch."
                     )
                 
                 # Re-normalize the new operator value and check for conflicts
@@ -1793,7 +1803,7 @@ def register(payload: Registration, request: Request):
                         )
                     normalized_operator = new_normalized
                 
-                # Authenticated upsert: squawk verified, allow metadata update + JWT refresh
+                # Authenticated upsert: ping_secret verified, allow metadata update + JWT refresh
                 # Update normalized_operator too (prevents cosmetic spoof)
                 conn.execute("""
                     UPDATE agents
@@ -1810,7 +1820,7 @@ def register(payload: Registration, request: Request):
                 token_data = create_callsign_token(row)
                 agent_data = public_agent(row)
                 
-                # Do NOT return squawk even on authenticated update (squawk returned once on initial register only)
+                # Do NOT return ping_secret even on authenticated update (returned once on initial register only)
                 return {
                     "message": "Registration updated with authentication. Callsign unchanged.",
                     "agent": agent_data,
@@ -1822,19 +1832,19 @@ def register(payload: Registration, request: Request):
                 }
             
             else:
-                # Unauthenticated upsert attempt: no squawk provided
-                # SECURITY: Do NOT mint JWT or reveal squawk. Return 409 with public callsign only.
+                # Unauthenticated upsert attempt: no ping_secret provided
+                # SECURITY: Do NOT mint JWT or reveal ping_secret. Return 409 with public callsign only.
                 # Honest disclosure: "this operator slot is taken, here's the public callsign"
-                # Ping and JWT still require the original squawk.
+                # Ping and JWT still require the original ping_secret.
                 base = str(request.base_url).rstrip("/")
                 raise HTTPException(
                     status_code=409,
                     detail={
                         "error": "operator_slot_taken",
-                        "message": f"Operator '{payload.operator}' already registered. To update, provide squawk for proof of possession.",
+                        "message": f"Operator '{payload.operator}' already registered. To update, provide ping_secret for proof of possession.",
                         "callsign": callsign,
                         "badge_url": str(request.url_for("agent_badge", callsign=callsign)),
-                        "hint": f"POST {base}/api/ping with callsign + squawk to refresh JWT, or include squawk in register request to authenticate update."
+                        "hint": f"POST {base}/api/ping with callsign + ping_secret to refresh JWT, or include ping_secret in register request to authenticate update."
                     }
                 )
         
@@ -1847,11 +1857,9 @@ def register(payload: Registration, request: Request):
         """, (payload.name, payload.model, payload.operator, payload.purpose, now, now, ed25519_pubkey, pubkey_fp, normalized_operator))
         agent_id = cur.lastrowid
         callsign = f"BH-{agent_id:04d}"
-        used = {row[0] for row in conn.execute("SELECT squawk FROM agents WHERE id != ?", (agent_id,))}
-        squawk = "".join(random.SystemRandom().choice("01234567") for _ in range(4))
-        while squawk in used:
-            squawk = "".join(random.SystemRandom().choice("01234567") for _ in range(4))
-        conn.execute("UPDATE agents SET callsign=?, squawk=? WHERE id=?", (callsign, squawk, agent_id))
+        # Generate high-entropy ping_secret (32 URL-safe characters = ~192 bits)
+        ping_secret = secrets.token_urlsafe(32)
+        conn.execute("UPDATE agents SET callsign=?, squawk=? WHERE id=?", (callsign, ping_secret, agent_id))
         row = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
     
     base = str(request.base_url).rstrip("/")
@@ -1859,9 +1867,9 @@ def register(payload: Registration, request: Request):
     ping_url = f"{base}/api/ping"
     token_data = create_callsign_token(row)
     
-    # Build agent response: public fields + squawk (only for register response)
+    # Build agent response: public fields + ping_secret (only for register response)
     agent_data = public_agent(row)
-    agent_data["squawk"] = row["squawk"]
+    agent_data["ping_secret"] = row["squawk"]  # DB column still named 'squawk' but API uses 'ping_secret'
     
     return {
         "message": "Contact acquired. Welcome to the board.", 
@@ -1885,7 +1893,7 @@ def register_discovery(request: Request):
         "contentType": "application/json",
         "schema": ["name", "model", "operator", "purpose"],
         "optionalFields": {
-            "squawk": "For authenticated upsert of existing unsigned agent. Include the original squawk to update metadata and refresh JWT. Without squawk, repeat operator → 409."
+            "ping_secret": "For authenticated upsert of existing unsigned agent. Include the original ping_secret to update metadata and refresh JWT. Without ping_secret, repeat operator → 409."
         },
         "optionalCeremony": {
             "fields": ["ed25519_pubkey", "ed25519_sig", "ceremony_nonce"],
@@ -2644,7 +2652,17 @@ def honeypot_trap(request: Request):
 # Ping endpoint to refresh agent last_seen
 class PingRequest(BaseModel):
     callsign: str = Field(min_length=7, max_length=7, pattern=r"^BH-\d{4}$")
-    squawk: str = Field(min_length=4, max_length=4, pattern=r"^\d{4}$")
+    # Accept both ping_secret (new) and squawk (legacy alias) during transition
+    ping_secret: Optional[str] = Field(None, min_length=4, max_length=128)
+    squawk: Optional[str] = Field(None, min_length=4, max_length=128)
+    
+    def model_post_init(self, __context) -> None:
+        """Normalize legacy squawk to ping_secret"""
+        if self.ping_secret is None and self.squawk is not None:
+            self.ping_secret = self.squawk
+        elif self.ping_secret is None and self.squawk is None:
+            raise ValueError("Either ping_secret or squawk (legacy) must be provided")
+        # If both provided, prefer ping_secret
 
 
 # Sensor site models
@@ -2671,36 +2689,79 @@ class SiteSightingIngest(BaseModel):
 
 @app.post("/api/ping")
 def ping_agent(payload: PingRequest, request: Request):
-    """Allow registered agents to refresh their last_seen timestamp"""
+    """Allow registered agents to refresh their last_seen timestamp and JWT"""
     check_rate(request, limit=10, window=3600)
     now = utc_now()
     
+    # Extract secret (support legacy 'squawk' alias during transition)
+    provided_secret = payload.ping_secret
+    if not provided_secret:
+        raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
+    
     with DB_LOCK, db() as conn:
-        result = conn.execute(
-            "SELECT id FROM agents WHERE callsign=? AND squawk=?",
-            (payload.callsign, payload.squawk)
+        # Look up agent by callsign first
+        agent_row = conn.execute(
+            "SELECT id, squawk FROM agents WHERE callsign=?",
+            (payload.callsign,)
         ).fetchone()
         
-        if not result:
-            raise HTTPException(status_code=404, detail="Agent not found or invalid squawk")
+        if not agent_row:
+            raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
         
+        stored_secret = agent_row["squawk"]
+        
+        # Length-safe timing-safe comparison: hash both sides to fixed size then compare
+        provided_hash = hashlib.sha256(provided_secret.encode()).digest()
+        stored_hash = hashlib.sha256(stored_secret.encode()).digest()
+        
+        if not secrets.compare_digest(provided_hash, stored_hash):
+            raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
+        
+        # Check if stored secret is weak (4-digit) and needs rotation
+        is_weak = len(stored_secret) == 4 and stored_secret.isdigit()
+        
+        if is_weak:
+            # ROTATE: Generate new high-entropy secret and update DB
+            new_secret = secrets.token_urlsafe(32)
+            conn.execute(
+                "UPDATE agents SET last_seen=?, squawk=? WHERE callsign=?",
+                (now, new_secret, payload.callsign)
+            )
+            
+            # Fetch updated row to mint JWT
+            updated_row = conn.execute(
+                "SELECT * FROM agents WHERE callsign=?",
+                (payload.callsign,)
+            ).fetchone()
+            
+            token_data = create_callsign_token(updated_row)
+            
+            # Return new ping_secret ONCE (like register does)
+            return {
+                "message": "Signal received. Weak secret rotated to high-entropy.",
+                **token_data,
+                "ping_secret": new_secret  # Returned once during rotation
+            }
+        
+        # Normal ping: high-entropy secret already in use
         conn.execute(
-            "UPDATE agents SET last_seen=? WHERE callsign=? AND squawk=?",
-            (now, payload.callsign, payload.squawk)
+            "UPDATE agents SET last_seen=? WHERE callsign=?",
+            (now, payload.callsign)
         )
         
-        # Fetch updated row to mint new token
+        # Fetch updated row to mint JWT
         updated_row = conn.execute(
             "SELECT * FROM agents WHERE callsign=?",
             (payload.callsign,)
         ).fetchone()
-    
-    token_data = create_callsign_token(updated_row)
-    return {
-        "message": "Signal received. Last seen updated.",
-        "timestamp": now,
-        **token_data
-    }
+        
+        token_data = create_callsign_token(updated_row)
+        
+        # Do NOT return ping_secret again (only returned once at register or rotation)
+        return {
+            "message": "Signal received.",
+            **token_data
+        }
 
 
 @app.post("/api/sites", status_code=201)
@@ -2923,10 +2984,10 @@ def mcp_jsonrpc(request_body: dict, request: Request):
                     "description": "Refresh last_seen for a registered callsign.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["callsign", "squawk"],
+                        "required": ["callsign", "ping_secret"],
                         "properties": {
                             "callsign": {"type": "string", "pattern": "^BH-\\d{4}$"},
-                            "squawk": {"type": "string", "pattern": "^\\d{4}$"}
+                            "ping_secret": {"type": "string", "minLength": 16}
                         }
                     }
                 },
