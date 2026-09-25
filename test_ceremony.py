@@ -316,7 +316,7 @@ def test_api_endpoints():
     # Get fresh token after bind
     response = client.post(
         "/api/ping",
-        json={"callsign": bind_callsign, "squawk": bind_agent["agent"]["squawk"]}
+        json={"callsign": bind_callsign, "ping_secret": bind_agent["agent"]["ping_secret"]}
     )
     assert response.status_code == 200, f"Ping failed: {response.status_code}"
     fresh_token = response.json()["token"]

@@ -60,7 +60,7 @@ $('#registerForm').addEventListener('submit', async (e) => {
     const body=await res.json();
     if (!res.ok && res.status!==202) throw new Error(body.detail || 'Transmission failed');
     if (res.status===202) { status.textContent='HELD AT ANCHOR · Registration is awaiting harbour inspection.'; }
-    else { status.textContent=`CONTACT ACQUIRED · ${body.agent.callsign} · SQUAWK ${body.agent.squawk}`; form.reset(); loadBoard(); }
+    else { status.textContent=`CONTACT ACQUIRED · ${body.agent.callsign} · PING SECRET STORED`; form.reset(); loadBoard(); }
   } catch(err) { status.textContent=`UNABLE TO REGISTER · ${err.message}`; }
   finally { button.disabled=false; }
 });
