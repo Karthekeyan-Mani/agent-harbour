@@ -1495,10 +1495,10 @@ def openapi_agent(request: Request):
                     "Ping": {
                         "type": "object",
                         "additionalProperties": False,
-                        "required": ["callsign", "squawk"],
+                        "required": ["callsign", "ping_secret"],
                         "properties": {
                             "callsign": {"type": "string", "pattern": "^BH-\\d{4}$"},
-                            "squawk": {"type": "string", "pattern": "^\\d{4}$"}
+                            "ping_secret": {"type": "string", "minLength": 16}
                         }
                     }
                 }
@@ -2705,8 +2705,8 @@ def ping_agent(payload: PingRequest, request: Request):
         
         stored_secret = agent_row["squawk"]
         
-        # Verify provided secret matches stored
-        if provided_secret != stored_secret:
+        # Timing-safe comparison
+        if not secrets.compare_digest(provided_secret, stored_secret):
             raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
         
         # Check if stored secret is weak (4-digit) and needs rotation
@@ -2989,10 +2989,10 @@ def mcp_jsonrpc(request_body: dict, request: Request):
                     "description": "Refresh last_seen for a registered callsign.",
                     "inputSchema": {
                         "type": "object",
-                        "required": ["callsign", "squawk"],
+                        "required": ["callsign", "ping_secret"],
                         "properties": {
                             "callsign": {"type": "string", "pattern": "^BH-\\d{4}$"},
-                            "squawk": {"type": "string", "pattern": "^\\d{4}$"}
+                            "ping_secret": {"type": "string", "minLength": 16}
                         }
                     }
                 },
