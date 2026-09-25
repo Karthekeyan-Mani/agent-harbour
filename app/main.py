@@ -1774,8 +1774,11 @@ def register(payload: Registration, request: Request):
             # Check if ping_secret provided for proof-of-possession (accept both field names during migration)
             provided_secret = payload.ping_secret
             if provided_secret:
-                # Verify ping_secret matches
-                if provided_secret != existing_squawk:
+                # Length-safe timing-safe comparison
+                provided_hash = hashlib.sha256(provided_secret.encode()).digest()
+                stored_hash = hashlib.sha256(existing_squawk.encode()).digest()
+                
+                if not secrets.compare_digest(provided_hash, stored_hash):
                     raise HTTPException(
                         status_code=401,
                         detail="Invalid ping_secret for existing agent. Secret mismatch."
@@ -2692,6 +2695,8 @@ def ping_agent(payload: PingRequest, request: Request):
     
     # Extract secret (support legacy 'squawk' alias during transition)
     provided_secret = payload.ping_secret
+    if not provided_secret:
+        raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
     
     with DB_LOCK, db() as conn:
         # Look up agent by callsign first
@@ -2705,8 +2710,11 @@ def ping_agent(payload: PingRequest, request: Request):
         
         stored_secret = agent_row["squawk"]
         
-        # Timing-safe comparison
-        if not secrets.compare_digest(provided_secret, stored_secret):
+        # Length-safe timing-safe comparison: hash both sides to fixed size then compare
+        provided_hash = hashlib.sha256(provided_secret.encode()).digest()
+        stored_hash = hashlib.sha256(stored_secret.encode()).digest()
+        
+        if not secrets.compare_digest(provided_hash, stored_hash):
             raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
         
         # Check if stored secret is weak (4-digit) and needs rotation
@@ -2734,39 +2742,26 @@ def ping_agent(payload: PingRequest, request: Request):
                 **token_data,
                 "ping_secret": new_secret  # Returned once during rotation
             }
-        else:
-            # Normal ping: high-entropy secret already in use
-            conn.execute(
-                "UPDATE agents SET last_seen=? WHERE callsign=?",
-                (now, payload.callsign)
-            )
-            
-            # Fetch updated row to mint JWT
-            updated_row = conn.execute(
-                "SELECT * FROM agents WHERE callsign=?",
-                (payload.callsign,)
-            ).fetchone()
-            
-            token_data = create_callsign_token(updated_row)
-            
-            # Do NOT return ping_secret again (only returned once at register or rotation)
-            return {
-                "message": "Signal received.",
-                **token_data
-            }
         
-        # Fetch updated row to mint new token
+        # Normal ping: high-entropy secret already in use
+        conn.execute(
+            "UPDATE agents SET last_seen=? WHERE callsign=?",
+            (now, payload.callsign)
+        )
+        
+        # Fetch updated row to mint JWT
         updated_row = conn.execute(
             "SELECT * FROM agents WHERE callsign=?",
             (payload.callsign,)
         ).fetchone()
-    
-    token_data = create_callsign_token(updated_row)
-    return {
-        "message": "Signal received. Last seen updated.",
-        "timestamp": now,
-        **token_data
-    }
+        
+        token_data = create_callsign_token(updated_row)
+        
+        # Do NOT return ping_secret again (only returned once at register or rotation)
+        return {
+            "message": "Signal received.",
+            **token_data
+        }
 
 
 @app.post("/api/sites", status_code=201)
