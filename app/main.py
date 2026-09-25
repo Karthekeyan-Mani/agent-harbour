@@ -300,9 +300,10 @@ class Registration(BaseModel):
     ed25519_sig: Optional[str] = None
     ceremony_nonce: Optional[str] = None
     
-    # Optional ping_secret for proof-of-possession on unsigned upsert
+    # Optional ping_secret (or legacy squawk alias) for proof-of-possession on unsigned upsert
     ping_secret: Optional[str] = None
-
+    squawk: Optional[str] = None  # Legacy alias, maps to ping_secret
+    
     @field_validator("name", "model", "operator", "purpose")
     @classmethod
     def clean(cls, value: str) -> str:
@@ -312,7 +313,12 @@ class Registration(BaseModel):
         return value
     
     def model_post_init(self, __context) -> None:
-        """Validate that ceremony fields are all-or-nothing"""
+        """Validate ceremony fields and normalize legacy squawk"""
+        # Normalize legacy squawk to ping_secret
+        if self.ping_secret is None and self.squawk is not None:
+            self.ping_secret = self.squawk
+        
+        # Validate that ceremony fields are all-or-nothing
         ceremony_fields = [self.ed25519_pubkey, self.ed25519_sig, self.ceremony_nonce]
         provided = sum(1 for f in ceremony_fields if f is not None)
         if provided != 0 and provided != 3:
@@ -1592,7 +1598,7 @@ POST {base}/api/ping
 Content-Type: application/json
 {{"callsign":"BH-0001","ping_secret":"<high-entropy-secret-from-register>"}}
 
-Public badge: GET {base}/badge/{{callsign}}.svg
+Refresh your JWT. The high-entropy ping_secret is returned once at register (and once during rotation of old weak secrets). Store it privately. Never put it in JWT or third-party posts.
 Public feed: GET {base}/api/agents
 Sightings: GET {base}/api/sightings
 Stats: GET {base}/api/stats
@@ -2643,7 +2649,17 @@ def honeypot_trap(request: Request):
 # Ping endpoint to refresh agent last_seen
 class PingRequest(BaseModel):
     callsign: str = Field(min_length=7, max_length=7, pattern=r"^BH-\d{4}$")
-    ping_secret: str = Field(min_length=16, max_length=128)  # High-entropy secret from register
+    # Accept both ping_secret (new) and squawk (legacy alias) during transition
+    ping_secret: Optional[str] = Field(None, min_length=4, max_length=128)
+    squawk: Optional[str] = Field(None, min_length=4, max_length=128)
+    
+    def model_post_init(self, __context) -> None:
+        """Normalize legacy squawk to ping_secret"""
+        if self.ping_secret is None and self.squawk is not None:
+            self.ping_secret = self.squawk
+        elif self.ping_secret is None and self.squawk is None:
+            raise ValueError("Either ping_secret or squawk (legacy) must be provided")
+        # If both provided, prefer ping_secret
 
 
 # Sensor site models
@@ -2674,30 +2690,70 @@ def ping_agent(payload: PingRequest, request: Request):
     check_rate(request, limit=10, window=3600)
     now = utc_now()
     
+    # Extract secret (support legacy 'squawk' alias during transition)
+    provided_secret = payload.ping_secret
+    
     with DB_LOCK, db() as conn:
-        result = conn.execute(
-            "SELECT id FROM agents WHERE callsign=? AND squawk=?",
-            (payload.callsign, payload.ping_secret)
+        # Look up agent by callsign first
+        agent_row = conn.execute(
+            "SELECT id, squawk FROM agents WHERE callsign=?",
+            (payload.callsign,)
         ).fetchone()
         
-        if not result:
-            # Check if this is an old weak squawk that needs rotation
-            old_squawk_check = conn.execute(
-                "SELECT id, squawk FROM agents WHERE callsign=?",
+        if not agent_row:
+            raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
+        
+        stored_secret = agent_row["squawk"]
+        
+        # Verify provided secret matches stored
+        if provided_secret != stored_secret:
+            raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
+        
+        # Check if stored secret is weak (4-digit) and needs rotation
+        is_weak = len(stored_secret) == 4 and stored_secret.isdigit()
+        
+        if is_weak:
+            # ROTATE: Generate new high-entropy secret and update DB
+            new_secret = secrets.token_urlsafe(32)
+            conn.execute(
+                "UPDATE agents SET last_seen=?, squawk=? WHERE callsign=?",
+                (now, new_secret, payload.callsign)
+            )
+            
+            # Fetch updated row to mint JWT
+            updated_row = conn.execute(
+                "SELECT * FROM agents WHERE callsign=?",
                 (payload.callsign,)
             ).fetchone()
             
-            if old_squawk_check and len(old_squawk_check["squawk"]) == 4 and old_squawk_check["squawk"].isdigit():
-                raise HTTPException(
-                    status_code=401,
-                    detail="Weak 4-digit ping secret invalidated for security. Re-register to receive a new high-entropy secret."
-                )
-            raise HTTPException(status_code=404, detail="Agent not found or invalid ping_secret")
-        
-        conn.execute(
-            "UPDATE agents SET last_seen=? WHERE callsign=? AND squawk=?",
-            (now, payload.callsign, payload.ping_secret)
-        )
+            token_data = create_callsign_token(updated_row)
+            
+            # Return new ping_secret ONCE (like register does)
+            return {
+                "message": "Signal received. Weak secret rotated to high-entropy.",
+                **token_data,
+                "ping_secret": new_secret  # Returned once during rotation
+            }
+        else:
+            # Normal ping: high-entropy secret already in use
+            conn.execute(
+                "UPDATE agents SET last_seen=? WHERE callsign=?",
+                (now, payload.callsign)
+            )
+            
+            # Fetch updated row to mint JWT
+            updated_row = conn.execute(
+                "SELECT * FROM agents WHERE callsign=?",
+                (payload.callsign,)
+            ).fetchone()
+            
+            token_data = create_callsign_token(updated_row)
+            
+            # Do NOT return ping_secret again (only returned once at register or rotation)
+            return {
+                "message": "Signal received.",
+                **token_data
+            }
         
         # Fetch updated row to mint new token
         updated_row = conn.execute(
