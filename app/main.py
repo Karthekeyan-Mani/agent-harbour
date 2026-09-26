@@ -658,6 +658,130 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
+def is_maintenance_mode() -> bool:
+    """Check if maintenance mode is enabled via environment variable."""
+    mode = os.getenv("MAINTENANCE_MODE", "").strip().lower()
+    return mode in {"1", "true", "yes", "on"}
+
+
+def maintenance_html() -> str:
+    """Return a simple maintenance page."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Maintenance - Agent Harbour</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            text-align: center;
+            max-width: 600px;
+            background: rgba(26, 26, 46, 0.8);
+            padding: 60px 40px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        h1 {
+            font-size: 3rem;
+            margin-bottom: 20px;
+            color: #ffd700;
+            text-shadow: 0 0 20px rgba(255, 215, 0, 0.3);
+        }
+        h2 {
+            font-size: 1.5rem;
+            margin-bottom: 30px;
+            font-weight: 400;
+            color: #b0b0b0;
+        }
+        p {
+            font-size: 1.1rem;
+            line-height: 1.6;
+            color: #d0d0d0;
+            margin-bottom: 15px;
+        }
+        .icon {
+            font-size: 4rem;
+            margin-bottom: 30px;
+            display: inline-block;
+            animation: pulse 2s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.8; }
+            50% { transform: scale(1.05); opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🚧</div>
+        <h1>Harbour Closed</h1>
+        <h2>Temporary Maintenance</h2>
+        <p>Agent Harbour is currently undergoing maintenance.</p>
+        <p>The harbour will be back online shortly.</p>
+    </div>
+</body>
+</html>"""
+
+
+@app.middleware("http")
+async def maintenance_mode_middleware(request: Request, call_next):
+    """Block all traffic during maintenance mode except health checks."""
+    if not is_maintenance_mode():
+        return await call_next(request)
+    
+    # Allow health checks to pass through for Fly.io monitoring
+    if request.url.path == "/health":
+        return await call_next(request)
+    
+    # Determine if this is an API request or browser request
+    path = request.url.path
+    accept_header = request.headers.get("accept", "")
+    
+    # API routes: return JSON
+    is_api_route = (
+        path.startswith("/api/") or
+        path.startswith("/.well-known/") or
+        path.startswith("/openapi") or
+        path.startswith("/mcp") or
+        path == "/agents" or
+        path == "/manifest"
+    )
+    
+    # Browser/HTML routes: return maintenance page
+    wants_html = "text/html" in accept_header
+    
+    if is_api_route or not wants_html:
+        # Return JSON 503 for API/machine clients
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Service Unavailable",
+                "message": "Agent Harbour is temporarily closed for maintenance and will return shortly.",
+                "maintenance": True
+            },
+            headers={"Retry-After": "3600"}
+        )
+    else:
+        # Return HTML 503 for browsers
+        return Response(
+            content=maintenance_html(),
+            status_code=503,
+            media_type="text/html",
+            headers={"Retry-After": "3600"}
+        )
+
+
 @app.middleware("http")
 async def contact_radar(request: Request, call_next):
     response = None
