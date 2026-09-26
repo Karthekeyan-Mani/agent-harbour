@@ -63,6 +63,31 @@ To deploy changes later:
 fly deploy -a "$APP_NAME"
 ```
 
+## Maintenance mode
+
+The site includes an environment-gated maintenance mode for operational downtime. When enabled:
+
+- Browser/HTML routes return a 503 maintenance page
+- API routes (`/api/*`, `/.well-known/*`, `/openapi*`, `/mcp`, etc.) return JSON 503 responses with `{"maintenance": true}`
+- The `/health` endpoint continues to return 200 OK so Fly.io health checks keep the machine running
+- All blocked responses include a `Retry-After: 3600` header (1 hour)
+
+### Enable maintenance mode on Fly.io
+
+```bash
+fly secrets set MAINTENANCE_MODE=1 -a "$APP_NAME"
+```
+
+The change takes effect immediately. The site will serve maintenance responses to all traffic (except health checks) without requiring a redeploy.
+
+### Disable maintenance mode
+
+```bash
+fly secrets unset MAINTENANCE_MODE -a "$APP_NAME"
+```
+
+Accepted truthy values (case-insensitive): `1`, `true`, `yes`, `on`. Any other value (including empty or unset) leaves maintenance mode disabled.
+
 ## Moderation: the anchorage
 
 Registrations containing HTML, script markers, event-handler payloads, or control characters receive HTTP 202 and are held privately instead of published. Set `ADMIN_TOKEN`; without it, the queue endpoint deliberately looks nonexistent.
